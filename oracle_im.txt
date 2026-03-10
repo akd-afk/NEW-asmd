@@ -1,3 +1,339 @@
+===============\\\
+
+Yes, absolutely. Here's exactly how to simulate partial partition removal from IM in QA.
+
+---
+
+### The Concept
+```
+PROD state we are simulating:
+  - Some partitions/subpartitions = COMPLETED in IM  ✅
+  - Some partitions/subpartitions = OUT OF MEMORY    ❌
+  - Query hits BOTH = mixed IM + Exadata scan = SLOW
+```
+
+---
+
+### Step 1 — Identify Which Partitions to Partially Evict
+
+```sql
+-- First see all partitions currently in IM store in QA
+-- Pick ONE or TWO that the slow query is known to scan
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(bytes/1024/1024/1024,         2) AS orig_gb,
+       ROUND(inmemory_size/1024/1024/1024,  2) AS inmem_gb,
+       inmemory_priority
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+AND    inst_id      = 1
+ORDER  BY inmemory_size DESC;
+
+-- Identify the partition your slow query is scanning
+-- Look at execution plan Pstart/Pstop from Step 7.2
+-- The partition being scanned is your target for eviction
+```
+
+---
+
+### Step 2 — Three Options to Simulate Partial Eviction
+
+---
+
+#### Option A — Remove ONE Specific Partition from IM
+```sql
+-- Most surgical — closest to PROD scenario
+-- Replace &&PARTITION_NAME with actual name from Step 1
+
+-- BEFORE: Record its current state
+SELECT partition_name,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression
+FROM   dba_tab_partitions
+WHERE  table_owner     = '&&SCHEMA_OWNER'
+AND    table_name      = '&&TABLE_NAME'
+AND    partition_name  = '&&PARTITION_NAME';
+
+-- REMOVE from IM (partition level only)
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY PARTITION &&PARTITION_NAME
+  NO INMEMORY;
+
+-- Confirm it dropped from GV$IM_SEGMENTS
+-- May take 30-60 seconds to evict
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner           = '&&SCHEMA_OWNER'
+AND    segment_name    = '&&TABLE_NAME'
+AND    partition_name  = '&&PARTITION_NAME';
+-- Target: 0 rows = partition evicted from IM
+```
+
+---
+
+#### Option B — Remove ONE Specific Subpartition from IM
+```sql
+-- Even more surgical — targets a specific subpartition
+-- Replace &&SUBPARTITION_NAME with actual name from Step 1
+
+-- BEFORE: Record its current state
+SELECT subpartition_name,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression
+FROM   dba_tab_subpartitions
+WHERE  table_owner        = '&&SCHEMA_OWNER'
+AND    table_name         = '&&TABLE_NAME'
+AND    subpartition_name  = '&&SUBPARTITION_NAME';
+
+-- REMOVE subpartition from IM
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY SUBPARTITION &&SUBPARTITION_NAME
+  NO INMEMORY;
+
+-- Confirm eviction
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner           = '&&SCHEMA_OWNER'
+AND    segment_name    = '&&TABLE_NAME'
+AND    partition_name  = '&&SUBPARTITION_NAME';
+-- Target: 0 rows = subpartition evicted
+```
+
+---
+
+#### Option C — Downgrade Priority to NONE on ONE Partition
+```sql
+-- Softer simulation
+-- Partition stays INMEMORY enabled but will not auto-repopulate
+-- Simulates the state just AFTER eviction before repopulation
+
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY PARTITION &&PARTITION_NAME
+  INMEMORY PRIORITY NONE;
+
+-- Then flush that partition from IM by using:
+-- (forces Oracle to drop it from IM store without NO INMEMORY)
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY PARTITION &&PARTITION_NAME
+  NO INMEMORY;
+
+-- Re-enable with NONE priority immediately
+-- Now it is ENABLED but will NOT auto-populate
+-- = simulates OUT OF MEMORY state
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY PARTITION &&PARTITION_NAME
+  INMEMORY PRIORITY NONE;
+
+-- Confirm state
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner          = '&&SCHEMA_OWNER'
+AND    segment_name   = '&&TABLE_NAME'
+AND    partition_name = '&&PARTITION_NAME';
+```
+
+---
+
+### Step 3 — Confirm Partial State Before Running Query
+
+```sql
+-- This is the key check
+-- You want to see MIXED state:
+-- Some partitions = COMPLETED
+-- Target partition = missing or OUT OF MEMORY
+
+SELECT inst_id,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(inmemory_size/1024/1024/1024,       2) AS inmem_gb,
+       ROUND(bytes_not_populated/1024/1024,       2) AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+AND    inst_id      = 1
+ORDER  BY partition_name;
+
+-- Expected mixed output:
+-- PART_1   COMPLETED      5.2 GB    0 MB   ✅
+-- PART_2   COMPLETED      5.1 GB    0 MB   ✅
+-- PART_3   (missing row)                   ❌  ← your evicted one
+-- PART_4   COMPLETED      4.9 GB    0 MB   ✅
+```
+
+---
+
+### Step 4 — Run the Slow Query and Capture Behaviour
+
+```sql
+-- Run with GATHER_PLAN_STATISTICS to capture actual row counts
+-- Add hint to your slow query:
+-- SELECT /*+ GATHER_PLAN_STATISTICS PARALLEL(2) */ ...
+
+-- Immediately after execution pull the plan
+SELECT *
+FROM   TABLE(
+         DBMS_XPLAN.DISPLAY_CURSOR(
+           sql_id       => '&&SQL_ID',
+           child_number => 0,
+           format       => 'ALLSTATS LAST +PREDICATE +PARTITION'
+         )
+       );
+
+-- What to look for:
+-- GOOD partitions: TABLE ACCESS INMEMORY FULL
+-- Evicted partition: TABLE ACCESS STORAGE FULL
+--                    or TABLE ACCESS FULL
+-- This split confirms the mixed scan behaviour
+
+-- Check disk reads confirm storage access
+SELECT sql_id,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2) AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY last_active_time DESC
+FETCH  FIRST 3 ROWS ONLY;
+
+-- Expected during partial eviction test:
+-- avg_secs  = slower than baseline
+-- im_scans  > 0  (partial IM still used)
+-- disk_reads > 0  (evicted partition going to storage)
+```
+
+---
+
+### Step 5 — Restore QA to Good State
+
+```sql
+-- IMPORTANT: Always restore QA after testing
+
+-- Restore the evicted partition back to INMEMORY
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY PARTITION &&PARTITION_NAME
+  INMEMORY PRIORITY CRITICAL;
+
+-- OR for subpartition:
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  MODIFY SUBPARTITION &&SUBPARTITION_NAME
+  INMEMORY PRIORITY CRITICAL;
+
+-- Force immediate repopulation
+-- Use the dynamically generated command from Step 8.1:
+SELECT 'EXEC DBMS_INMEMORY.REPOPULATE('''
+       || owner        || ''','''
+       || segment_name || ''','''
+       || partition_name
+       || ''');'                                    AS repop_cmd
+FROM   gv$im_segments
+WHERE  owner               = '&&SCHEMA_OWNER'
+AND    segment_name        = '&&TABLE_NAME'
+AND    inst_id             = 1
+AND    (bytes_not_populated > 0
+    OR  populate_status   != 'COMPLETED')
+ORDER  BY bytes_not_populated DESC;
+
+-- Monitor until fully restored
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+ORDER  BY inst_id, bytes_not_populated DESC;
+-- Target: not_pop_mb = 0 for all rows
+
+-- Confirm query is fast again
+SELECT sql_id,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2) AS avg_secs,
+       im_scans,
+       disk_reads
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY last_active_time DESC
+FETCH  FIRST 3 ROWS ONLY;
+-- Target: avg_secs back to fast, disk_reads = 0
+```
+
+---
+
+### Regression Test Result Template
+
+```
+TEST SCENARIO: Partial IM Partition Eviction
+=============================================
+Target partition evicted : &&PARTITION_NAME
+Option used              : A / B / C
+
+BEFORE eviction:
+  avg_secs   = ___
+  im_scans   = ___
+  disk_reads = ___
+  Plan shows = TABLE ACCESS INMEMORY FULL
+
+DURING partial eviction:
+  avg_secs   = ___   (expect: slower)
+  im_scans   = ___   (expect: > 0, partial)
+  disk_reads = ___   (expect: > 0)
+  Plan shows = TABLE ACCESS STORAGE FULL on evicted partition
+
+AFTER restore:
+  avg_secs   = ___   (expect: back to fast)
+  im_scans   = ___   (expect: > 0)
+  disk_reads = ___   (expect: 0)
+  Plan shows = TABLE ACCESS INMEMORY FULL
+
+CONCLUSION:
+  Partial eviction caused slowness  : YES / NO
+  Restore resolved slowness         : YES / NO
+  Root cause confirmed              : YES / NO
+```
+
+---
+
+### Which Option to Use
+
+| Option | Best For | Risk |
+|--------|----------|------|
+| **A — Partition NO INMEMORY** | Exact match to PROD — one partition missing from IM | Low — single partition only |
+| **B — Subpartition NO INMEMORY** | More granular — closer to the actual bytes_not_populated seen | Low — single subpartition only |
+| **C — Priority NONE then re-enable** | Simulates mid-repopulation state | Low — no permanent change |
+
+**Option B is the most realistic** — it matches exactly what was seen in PROD where specific subpartitions had `bytes_not_populated > 0`.
+
+
+
+
+////////////////////////////////////////
+
+
+
+
+
+
+
+
+
+
+
 ================================================================================
   ORACLE IN-MEMORY COLUMN STORE — PARTITION TROUBLESHOOTING
   Issue: Slow query in PROD vs QA | IM buffer busy | gc waits | enq:IN
