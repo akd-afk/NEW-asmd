@@ -1,0 +1,1184 @@
+================================================================================
+  ORACLE IN-MEMORY COLUMN STORE — PARTITION TROUBLESHOOTING
+  Issue: Slow query in PROD vs QA | IM buffer busy | gc waits | enq:IN
+  Environment: RAC (2 nodes) | Exadata | CDB/PDB | Oracle 19c+
+================================================================================
+
+  HOW TO USE THIS FILE:
+  ─────────────────────────────────────────────────────────────────────────────
+  All sensitive values have been replaced with placeholders.
+  Before running ANY script, replace the following placeholders
+  with your actual values:
+
+    &&SCHEMA_OWNER       = Schema/owner of the table
+                           Example: REPLACE &&SCHEMA_OWNER WITH myschema
+
+    &&TABLE_NAME         = The large partitioned table name
+                           Example: REPLACE &&TABLE_NAME WITH my_table
+
+    &&VIEW_TABLE_1       = First view or table in the slow query
+                           Example: current_arrangement_dimension_v
+
+    &&VIEW_TABLE_2       = Second view or table in the slow query
+                           Example: current_entity_department_organization_v
+
+    &&SQL_KEYWORD        = A unique keyword from the slow SQL text
+                           Used to find it in V$SQL
+                           Example: arrangement_dimension
+
+    &&SQL_ID             = The sql_id of the slow query
+                           Obtained from Step 7.1
+
+    &&GOOD_PLAN_HASH     = The plan_hash_value from the fast QA execution
+                           Obtained from Step 7.4 run in QA
+
+  SEARCH AND REPLACE IN ANY TEXT EDITOR:
+    Find: &&SCHEMA_OWNER   Replace with: your_actual_owner
+    Find: &&TABLE_NAME     Replace with: your_actual_table
+    Find: &&VIEW_TABLE_1   Replace with: your_actual_view_1
+    Find: &&VIEW_TABLE_2   Replace with: your_actual_view_2
+    Find: &&SQL_KEYWORD    Replace with: your_actual_keyword
+    Find: &&SQL_ID         Replace with: your_actual_sql_id
+    Find: &&GOOD_PLAN_HASH Replace with: your_actual_hash_value
+  ─────────────────────────────────────────────────────────────────────────────
+
+  EXECUTION RULES:
+  - Execute ALL scripts connected as SYSDBA or DBA privileged user
+  - Connect to the correct PDB before running data queries
+  - Run steps IN ORDER — each step informs the next
+  - Do NOT hardcode partition/subpartition names anywhere
+  - Always generate ALTER/REPOPULATE commands dynamically (Step 8)
+  - Validate Oracle version before calling DBMS_INMEMORY procedures
+
+================================================================================
+STEP 1: VERIFY ORACLE VERSION AND ENVIRONMENT
+================================================================================
+
+-- 1.1 Get exact Oracle version (affects DBMS_INMEMORY behavior)
+SELECT version_full,
+       instance_name,
+       host_name,
+       startup_time,
+       ROUND((SYSDATE - startup_time), 1) AS uptime_days
+FROM   v$instance;
+
+-- 1.2 Confirm CDB/PDB context
+-- Make sure you are connected to the correct PDB before proceeding
+SELECT con_id,
+       con_name,
+       cdb,
+       open_mode
+FROM   v$pdbs
+ORDER  BY con_id;
+
+-- 1.3 Confirm RAC instances
+SELECT inst_id,
+       instance_name,
+       host_name,
+       status,
+       startup_time
+FROM   gv$instance
+ORDER  BY inst_id;
+
+-- 1.4 Verify DBMS_INMEMORY procedures available in this version
+SELECT object_name,
+       procedure_name,
+       overload
+FROM   dba_procedures
+WHERE  object_name = 'DBMS_INMEMORY'
+ORDER  BY procedure_name;
+
+-- 1.5 Verify exact REPOPULATE parameter signature
+SELECT argument_name,
+       position,
+       data_type,
+       defaulted
+FROM   dba_arguments
+WHERE  object_name  = 'REPOPULATE'
+AND    package_name = 'DBMS_INMEMORY'
+ORDER  BY position;
+
+-- 1.6 Verify exact POPULATE parameter signature
+SELECT argument_name,
+       position,
+       data_type,
+       defaulted
+FROM   dba_arguments
+WHERE  object_name  = 'POPULATE'
+AND    package_name = 'DBMS_INMEMORY'
+ORDER  BY position;
+
+
+================================================================================
+STEP 2: VERIFY CORRECT VIEW NAMES AVAILABLE IN YOUR ENVIRONMENT
+================================================================================
+
+-- 2.1 Confirm all IM-related dynamic views available
+SELECT view_name
+FROM   dba_views
+WHERE  view_name LIKE '%INMEMORY%'
+    OR view_name LIKE '%IM_%'
+ORDER  BY view_name;
+
+-- 2.2 Confirm GV$ fixed views available
+SELECT name
+FROM   v$fixed_view_definition
+WHERE  name LIKE '%INMEM%'
+    OR name LIKE '%IM_%'
+ORDER  BY name;
+
+-- 2.3 Confirm GV$IM_SEGMENTS columns before using the view
+SELECT column_name,
+       data_type
+FROM   dba_tab_columns
+WHERE  table_name = 'GV$IM_SEGMENTS'
+ORDER  BY column_id;
+
+-- NOTE: If GV$IM_SEGMENTS is not available,
+-- use V$IM_SEGMENTS for current instance only
+
+
+================================================================================
+STEP 3: CURRENT STATE OF GV$INMEMORY_AREA
+================================================================================
+
+-- 3.1 Pool status across all RAC instances
+SELECT inst_id,
+       pool,
+       ROUND(alloc_bytes / 1024/1024/1024, 2)  AS allocated_gb,
+       ROUND(used_bytes  / 1024/1024/1024, 2)  AS used_gb,
+       populate_status,
+       con_id
+FROM   gv$inmemory_area
+ORDER  BY inst_id, pool;
+
+-- NOTE: used_bytes showing TB range is a CUMULATIVE COUNTER
+-- not current usage. This is expected behavior.
+-- Do not be alarmed by TB values. See Step 3.2 to confirm.
+
+-- 3.2 Confirm actual vs reported usage
+-- If actual_inmem_gb << allocated_gb = TB counter is cumulative
+SELECT inst_id,
+       ROUND(SUM(inmemory_size)/1024/1024/1024, 2) AS actual_inmem_gb
+FROM   gv$im_segments
+GROUP  BY inst_id
+ORDER  BY inst_id;
+
+
+================================================================================
+STEP 4: FULL IM STORE INVENTORY — ALL SEGMENTS
+================================================================================
+
+-- 4.1 Summary by owner across all instances
+SELECT inst_id,
+       owner,
+       COUNT(*)                                        AS num_segments,
+       ROUND(SUM(inmemory_size)/1024/1024/1024,   2)  AS total_inmem_gb,
+       ROUND(SUM(bytes)/1024/1024/1024,            2)  AS total_orig_gb,
+       ROUND(SUM(bytes_not_populated)/1024/1024,   2)  AS total_not_pop_mb,
+       SUM(CASE WHEN populate_status = 'COMPLETED'
+                THEN 1 ELSE 0 END)                     AS completed_count,
+       SUM(CASE WHEN populate_status != 'COMPLETED'
+                THEN 1 ELSE 0 END)                     AS incomplete_count
+FROM   gv$im_segments
+GROUP  BY inst_id, owner
+ORDER  BY inst_id, total_inmem_gb DESC;
+
+-- 4.2 Full detail of every segment — all owners
+SELECT inst_id,
+       owner,
+       segment_name,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(bytes               /1024/1024/1024, 3)  AS orig_gb,
+       ROUND(inmemory_size       /1024/1024/1024, 3)  AS inmem_gb,
+       ROUND(bytes_not_populated /1024/1024,      2)  AS not_pop_mb,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_distribute,
+       inmemory_duplicate
+FROM   gv$im_segments
+ORDER  BY inst_id,
+          owner,
+          segment_name,
+          partition_name NULLS FIRST;
+
+
+================================================================================
+STEP 5: TARGET TABLE — PARTITION AND SUBPARTITION INVENTORY
+-- Replace &&SCHEMA_OWNER and &&TABLE_NAME before running
+================================================================================
+
+-- 5.1 Get ALL partitions from dictionary
+-- RUN THIS FIRST before any ALTER or REPOPULATE commands
+SELECT partition_name,
+       partition_position,
+       num_rows,
+       blocks,
+       last_analyzed,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_distribute,
+       inmemory_duplicate
+FROM   dba_tab_partitions
+WHERE  table_owner = '&&SCHEMA_OWNER'
+AND    table_name  = '&&TABLE_NAME'
+ORDER  BY partition_position;
+
+-- 5.2 Get ALL subpartitions from dictionary
+SELECT subpartition_name,
+       partition_name,
+       subpartition_position,
+       num_rows,
+       blocks,
+       last_analyzed,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_distribute,
+       inmemory_duplicate
+FROM   dba_tab_subpartitions
+WHERE  table_owner = '&&SCHEMA_OWNER'
+AND    table_name  = '&&TABLE_NAME'
+ORDER  BY partition_name,
+          subpartition_position;
+
+-- 5.3 Table-level INMEMORY settings
+SELECT table_name,
+       partitioned,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_distribute,
+       inmemory_duplicate,
+       degree
+FROM   dba_tables
+WHERE  owner      = '&&SCHEMA_OWNER'
+AND    table_name = '&&TABLE_NAME';
+
+-- 5.4 Current IM store status — all partitions and subpartitions
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(bytes               /1024/1024/1024, 3)  AS orig_gb,
+       ROUND(inmemory_size       /1024/1024/1024, 3)  AS inmem_gb,
+       ROUND(bytes_not_populated /1024/1024,      2)  AS not_pop_mb,
+       inmemory_priority,
+       inmemory_compression
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+ORDER  BY inst_id,
+          segment_type,
+          partition_name;
+
+-- 5.5 Find partitions/subpartitions NOT in IM store
+-- (marked INMEMORY in dictionary but absent from GV$IM_SEGMENTS)
+SELECT p.partition_name,
+       'PARTITION'         AS segment_type,
+       p.inmemory_priority,
+       p.num_rows,
+       p.blocks
+FROM   dba_tab_partitions p
+WHERE  p.table_owner = '&&SCHEMA_OWNER'
+AND    p.table_name  = '&&TABLE_NAME'
+AND    p.inmemory    = 'ENABLED'
+AND    NOT EXISTS (
+         SELECT 1
+         FROM   gv$im_segments im
+         WHERE  im.owner          = p.table_owner
+         AND    im.segment_name   = p.table_name
+         AND    im.partition_name = p.partition_name
+       )
+UNION ALL
+SELECT sp.subpartition_name,
+       'SUBPARTITION'      AS segment_type,
+       sp.inmemory_priority,
+       sp.num_rows,
+       sp.blocks
+FROM   dba_tab_subpartitions sp
+WHERE  sp.table_owner = '&&SCHEMA_OWNER'
+AND    sp.table_name  = '&&TABLE_NAME'
+AND    sp.inmemory    = 'ENABLED'
+AND    NOT EXISTS (
+         SELECT 1
+         FROM   gv$im_segments im
+         WHERE  im.owner          = sp.table_owner
+         AND    im.segment_name   = sp.table_name
+         AND    im.partition_name = sp.subpartition_name
+       )
+ORDER  BY segment_type, partition_name;
+
+-- 5.6 Find incomplete segments (bytes_not_populated > 0)
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(bytes_not_populated /1024/1024,      2)  AS not_pop_mb,
+       ROUND(inmemory_size       /1024/1024/1024,  3)  AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner               = '&&SCHEMA_OWNER'
+AND    segment_name        = '&&TABLE_NAME'
+AND    bytes_not_populated > 0
+ORDER  BY inst_id,
+          bytes_not_populated DESC;
+
+
+================================================================================
+STEP 6: DIAGNOSE WAIT EVENTS
+-- Wait events seen in ASH: IM buffer busy SHR, enq:IN,
+-- gc cr block 2-way, gc buffer busy acquire,
+-- cell multiblock physical read, cr request retry
+================================================================================
+
+-- 6.1 Current system-level wait event totals
+SELECT inst_id,
+       event,
+       total_waits,
+       total_timeouts,
+       ROUND(time_waited / 100,  2)  AS time_waited_secs,
+       ROUND(average_wait / 100, 4)  AS avg_wait_secs
+FROM   gv$system_event
+WHERE  event IN (
+         'IM buffer busy SHR',
+         'IM buffer busy EX',
+         'enq: IN - contention',
+         'gc cr block 2-way',
+         'gc buffer busy acquire',
+         'gc cr block busy',
+         'cell multiblock physical read',
+         'cell single block physical read: RDMA',
+         'cell single block physical read: xrmem cache',
+         'cr request retry'
+       )
+ORDER  BY inst_id,
+          time_waited DESC;
+
+-- 6.2 Check for active enq:IN locks right now
+-- IN = INMEMORY repopulation enqueue
+-- Rows returned here = table is actively repopulating = contention
+SELECT inst_id,
+       sid,
+       type,
+       id1,
+       id2,
+       lmode,
+       request,
+       block,
+       ctime
+FROM   gv$lock
+WHERE  type = 'IN'
+ORDER  BY inst_id, ctime DESC;
+
+-- 6.3 Check active sessions waiting on IM/RAC events right now
+SELECT s.inst_id,
+       s.sid,
+       s.serial#,
+       s.username,
+       s.status,
+       s.sql_id,
+       s.event,
+       s.wait_class,
+       s.seconds_in_wait,
+       ROUND(s.last_call_et, 0)  AS running_secs,
+       s.blocking_session,
+       s.blocking_instance
+FROM   gv$session s
+WHERE  s.status   = 'ACTIVE'
+AND    s.username IS NOT NULL
+AND    s.event    IN (
+         'IM buffer busy SHR',
+         'IM buffer busy EX',
+         'enq: IN - contention',
+         'gc cr block 2-way',
+         'gc buffer busy acquire',
+         'cell multiblock physical read'
+       )
+ORDER  BY s.last_call_et DESC;
+
+-- 6.4 RAC GC statistics by instance
+-- High gc cr blocks received = excessive cross-node data transfer
+SELECT inst_id,
+       event,
+       total_waits,
+       ROUND(time_waited / 100, 2)  AS secs_waited
+FROM   gv$system_event
+WHERE  event LIKE 'gc%'
+ORDER  BY inst_id,
+          time_waited DESC;
+
+-- 6.5 Verify Exadata cell offload vs IM scan activity
+-- If cell physical IO is high AND IM scan rows is low
+-- = queries falling through to Exadata = IM not fully serving data
+SELECT n.name,
+       s.inst_id,
+       s.value
+FROM   gv$sysstat  s
+JOIN   v$statname  n ON n.statistic# = s.statistic#
+WHERE  n.name IN (
+         'cell physical IO interconnect bytes',
+         'cell physical IO bytes eligible for predicate offload',
+         'cell physical IO bytes saved by storage index',
+         'IM scan rows',
+         'IM scan rows valid',
+         'IM scan rows cache',
+         'IM scan segments minmax eligible'
+       )
+ORDER  BY s.inst_id,
+          n.name;
+
+
+================================================================================
+STEP 7: EXECUTION PLAN ANALYSIS — PROD VS QA
+-- Replace &&SQL_KEYWORD with a unique word from your slow SQL
+================================================================================
+
+-- 7.1 Find the slow query in cursor cache
+SELECT sql_id,
+       child_number,
+       plan_hash_value,
+       executions,
+       ROUND(elapsed_time /1000000 / NULLIF(executions,0), 2)  AS avg_secs,
+       ROUND(cpu_time     /1000000 / NULLIF(executions,0), 2)  AS avg_cpu_secs,
+       disk_reads,
+       buffer_gets,
+       im_scans,
+       ROUND(im_scan_bytes_uncompressed/1024/1024, 2)          AS im_scan_mb,
+       last_active_time,
+       parsing_schema_name
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+AND    executions > 0
+ORDER  BY last_active_time DESC
+FETCH  FIRST 10 ROWS ONLY;
+
+-- 7.2 Pull full execution plan with partition pruning info
+-- Replace &&SQL_ID with the sql_id from Step 7.1 output
+SELECT *
+FROM   TABLE(
+         DBMS_XPLAN.DISPLAY_CURSOR(
+           sql_id       => '&&SQL_ID',
+           child_number => 0,
+           format       => 'ALLSTATS LAST +PREDICATE +PARTITION +ROWS'
+         )
+       );
+
+-- What to look for in the plan output:
+--
+-- GOOD signs:
+--   "TABLE ACCESS INMEMORY FULL"   = IM Column Store being used
+--   Pstart/Pstop = specific numbers = partition pruning working
+--
+-- BAD signs:
+--   "TABLE ACCESS STORAGE FULL"    = Exadata cell scan, NOT IM
+--   "TABLE ACCESS FULL"            = Buffer cache, NOT IM
+--   Pstart=1 Pstop=1048576         = NO partition pruning
+--                                    = ALL partitions being scanned
+--   Large A-Rows vs E-Rows gap     = cardinality misestimate
+
+-- 7.3 Check if multiple plans exist for this SQL
+-- Multiple plans = optimizer choosing between good and bad plan
+SELECT sql_id,
+       COUNT(DISTINCT plan_hash_value)  AS num_plans,
+       MIN(ROUND(elapsed_time/1000000
+           /NULLIF(executions,0),2))    AS best_avg_secs,
+       MAX(ROUND(elapsed_time/1000000
+           /NULLIF(executions,0),2))    AS worst_avg_secs
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+GROUP  BY sql_id
+HAVING COUNT(DISTINCT plan_hash_value) > 1;
+
+-- 7.4 Compare plan hash values between PROD and QA
+-- Run this in BOTH PROD and QA
+-- Same plan_hash_value = same plan structure
+-- Different plan_hash_value = optimizer chose different plan
+SELECT plan_hash_value,
+       executions,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0),2)  AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY last_active_time DESC
+FETCH  FIRST 5 ROWS ONLY;
+
+
+================================================================================
+STEP 8: GENERATE REMEDIATION COMMANDS DYNAMICALLY
+-- IMPORTANT: Run Step 5 FIRST to confirm real partition names
+-- Never hardcode partition or subpartition names
+================================================================================
+
+-- 8.1 Generate REPOPULATE commands — Instance 1
+-- Copy and execute the output of this query
+SELECT 'EXEC DBMS_INMEMORY.REPOPULATE('''
+       || owner        || ''','''
+       || segment_name || ''','''
+       || partition_name
+       || ''');'                                     AS repop_cmd,
+       inst_id,
+       segment_type,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2)      AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner               = '&&SCHEMA_OWNER'
+AND    segment_name        = '&&TABLE_NAME'
+AND    bytes_not_populated > 0
+AND    inst_id             = 1
+ORDER  BY bytes_not_populated DESC;
+
+-- 8.2 Generate REPOPULATE commands — Instance 2
+SELECT 'EXEC DBMS_INMEMORY.REPOPULATE('''
+       || owner        || ''','''
+       || segment_name || ''','''
+       || partition_name
+       || ''');'                                     AS repop_cmd,
+       inst_id,
+       segment_type,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2)      AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner               = '&&SCHEMA_OWNER'
+AND    segment_name        = '&&TABLE_NAME'
+AND    bytes_not_populated > 0
+AND    inst_id             = 2
+ORDER  BY bytes_not_populated DESC;
+
+-- 8.3 Generate ALTER commands — CRITICAL priority for PARTITIONS
+-- Copy and execute the output of this query
+SELECT 'ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME'
+       || ' MODIFY PARTITION ' || partition_name
+       || ' INMEMORY PRIORITY CRITICAL;'            AS alter_cmd,
+       partition_position,
+       inmemory_priority                             AS current_priority,
+       inmemory_compression                          AS current_compression
+FROM   dba_tab_partitions
+WHERE  table_owner    = '&&SCHEMA_OWNER'
+AND    table_name     = '&&TABLE_NAME'
+AND    inmemory       = 'ENABLED'
+ORDER  BY partition_position;
+
+-- 8.4 Generate ALTER commands — CRITICAL priority for SUBPARTITIONS
+SELECT 'ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME'
+       || ' MODIFY SUBPARTITION ' || subpartition_name
+       || ' INMEMORY PRIORITY CRITICAL;'            AS alter_cmd,
+       partition_name,
+       subpartition_position,
+       inmemory_priority                             AS current_priority,
+       inmemory_compression                          AS current_compression
+FROM   dba_tab_subpartitions
+WHERE  table_owner    = '&&SCHEMA_OWNER'
+AND    table_name     = '&&TABLE_NAME'
+AND    inmemory       = 'ENABLED'
+ORDER  BY partition_name,
+          subpartition_position;
+
+-- 8.5 Generate NO INMEMORY commands for LOW priority segments
+-- (candidates for removal to free IM space)
+SELECT 'ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME'
+       || ' MODIFY PARTITION ' || partition_name
+       || ' NO INMEMORY;'                           AS remove_cmd,
+       partition_name,
+       inmemory_priority
+FROM   dba_tab_partitions
+WHERE  table_owner       = '&&SCHEMA_OWNER'
+AND    table_name        = '&&TABLE_NAME'
+AND    inmemory          = 'ENABLED'
+AND    inmemory_priority = 'LOW'
+ORDER  BY partition_position;
+
+
+================================================================================
+STEP 9: APPLY FIXES — IN ORDER
+-- Run each fix then validate before proceeding to next
+================================================================================
+
+------------------------------------------------------------
+-- FIX A: Increase IM populate workers (no restart needed)
+-- Helps repopulation finish faster, reduces enq:IN duration
+------------------------------------------------------------
+SHOW PARAMETER inmemory_max_populate_servers;
+
+-- Adjust value based on available CPUs in your environment
+ALTER SYSTEM SET inmemory_max_populate_servers = 12
+  SCOPE = BOTH
+  SID   = '*';
+
+-- Verify applied on all RAC instances
+SELECT inst_id, name, value
+FROM   gv$parameter
+WHERE  name = 'inmemory_max_populate_servers'
+ORDER  BY inst_id;
+
+------------------------------------------------------------
+-- FIX B: Set CRITICAL priority at table level
+-- Prevents eviction mid-query. No restart needed.
+------------------------------------------------------------
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  INMEMORY PRIORITY CRITICAL;
+
+-- Verify
+SELECT table_name,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_distribute,
+       inmemory_duplicate
+FROM   dba_tables
+WHERE  owner      = '&&SCHEMA_OWNER'
+AND    table_name = '&&TABLE_NAME';
+
+------------------------------------------------------------
+-- FIX C: Fix INMEMORY_DISTRIBUTE for RAC partitioned table
+-- DISTRIBUTE BY PARTITION = each RAC node owns specific partitions
+-- Eliminates gc cr block 2-way cross-node waits
+-- No restart needed — triggers background repopulation
+------------------------------------------------------------
+-- Check current setting first
+SELECT table_name, inmemory_distribute
+FROM   dba_tables
+WHERE  owner      = '&&SCHEMA_OWNER'
+AND    table_name = '&&TABLE_NAME';
+
+-- Apply
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  INMEMORY DISTRIBUTE BY PARTITION;
+
+-- Verify
+SELECT table_name, inmemory_distribute
+FROM   dba_tables
+WHERE  owner      = '&&SCHEMA_OWNER'
+AND    table_name = '&&TABLE_NAME';
+
+------------------------------------------------------------
+-- FIX D: Execute REPOPULATE commands from Step 8.1 and 8.2
+-- Run the output of Step 8.1 here for Instance 1
+-- Run the output of Step 8.2 here for Instance 2
+-- Syntax: EXEC DBMS_INMEMORY.REPOPULATE('owner','table','partition');
+--
+-- Monitor progress until not_pop_mb = 0 for all rows
+------------------------------------------------------------
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2)     AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024,   2)    AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+ORDER  BY inst_id,
+          bytes_not_populated DESC;
+
+-- Re-run above until not_pop_mb = 0 for all partitions
+
+------------------------------------------------------------
+-- FIX E: Reduce parallel degree if IM buffer busy persists
+-- IM scans do not benefit from very high parallelism
+-- Too many PQ slaves = IM buffer busy SHR contention
+------------------------------------------------------------
+SELECT table_name, degree, instances
+FROM   dba_tables
+WHERE  owner      = '&&SCHEMA_OWNER'
+AND    table_name = '&&TABLE_NAME';
+
+-- Adjust degree value based on your environment
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME PARALLEL 4;
+
+SELECT table_name, degree
+FROM   dba_tables
+WHERE  owner      = '&&SCHEMA_OWNER'
+AND    table_name = '&&TABLE_NAME';
+
+
+================================================================================
+STEP 10: SQL PLAN BASELINE — PIN THE GOOD PLAN FROM QA
+-- Use this if optimizer keeps choosing the wrong plan in PROD
+-- Requires &&GOOD_PLAN_HASH from Step 7.4 run in QA
+-- Requires &&SQL_ID from Step 7.1
+================================================================================
+
+-- 10.1 Check if SQL Plan Baselines already exist
+SELECT sql_handle,
+       plan_name,
+       enabled,
+       accepted,
+       fixed,
+       origin,
+       created,
+       last_executed
+FROM   dba_sql_plan_baselines
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY created DESC;
+
+-- 10.2 Load the fast plan into SQL Plan Baseline
+-- Replace &&SQL_ID and &&GOOD_PLAN_HASH with values from Step 7
+DECLARE
+  l_plans PLS_INTEGER;
+BEGIN
+  l_plans := DBMS_SPM.LOAD_PLANS_FROM_CURSOR_CACHE(
+    sql_id          => '&&SQL_ID',
+    plan_hash_value => &&GOOD_PLAN_HASH,
+    fixed           => 'YES',
+    enabled         => 'YES'
+  );
+  DBMS_OUTPUT.PUT_LINE('Plans loaded: ' || l_plans);
+END;
+/
+
+-- 10.3 Verify baseline was created
+SELECT sql_handle,
+       plan_name,
+       enabled,
+       accepted,
+       fixed,
+       origin
+FROM   dba_sql_plan_baselines
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%';
+
+
+================================================================================
+STEP 11: IMMEDIATE WORKAROUND FOR APP TEAM
+-- Session-level only. No system changes. No restarts.
+================================================================================
+
+-- 11.1 Force query to single RAC instance
+-- Eliminates gc cr block 2-way and gc buffer busy entirely
+ALTER SESSION SET INSTANCE = 1;
+-- Run slow query and compare timing
+
+-- 11.2 Temporarily disable IM for the session
+-- Forces pure Exadata parallel scan
+-- Use to determine if IM contention is the cause
+ALTER SESSION SET inmemory_query = DISABLE;
+-- Run slow query and compare timing
+
+-- 11.3 Re-enable IM after testing
+ALTER SESSION SET inmemory_query = ENABLE;
+
+-- 11.4 Force higher parallelism without IM
+-- Add this hint to the slow query:
+-- SELECT /*+ PARALLEL(alias1, 8) PARALLEL(alias2, 8) NO_INMEMORY */
+
+-- 11.5 Check PGA sizing — hash join spill indicator
+SHOW PARAMETER pga_aggregate_target;
+SHOW PARAMETER pga_aggregate_limit;
+
+-- Check for multipass (disk spill) operations
+-- multipass > 0 = hash join is spilling to TEMP tablespace
+SELECT n.name,
+       s.inst_id,
+       s.value
+FROM   gv$sysstat  s
+JOIN   v$statname  n ON n.statistic# = s.statistic#
+WHERE  n.name IN (
+         'workarea executions - optimal',
+         'workarea executions - onepass',
+         'workarea executions - multipass'
+       )
+ORDER  BY s.inst_id, n.name;
+
+
+================================================================================
+STEP 12: QA REGRESSION TEST — REPRODUCE THE PROD ISSUE IN QA
+-- Goal: Prove that partial IM population causes slowness
+-- Method: Deliberately break IM in QA, confirm slowness,
+--         then restore IM and confirm speed returns
+-- This gives confidence that the fix is correct
+================================================================================
+
+------------------------------------------------------------
+-- PHASE 1: BASELINE — Record QA fast execution
+------------------------------------------------------------
+
+-- 12.1 Record current fast execution stats in QA BEFORE any changes
+SELECT sql_id,
+       plan_hash_value,
+       executions,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2)  AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY last_active_time DESC
+FETCH  FIRST 3 ROWS ONLY;
+
+-- 12.2 Record baseline IM population state in QA
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       segment_type,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024,   2)  AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024,    2)  AS inmem_gb,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_distribute
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+ORDER  BY inst_id, partition_name;
+
+-- Save this output — it is your GOOD baseline to restore to
+
+-- 12.3 Record QA GV$INMEMORY_AREA baseline
+SELECT inst_id,
+       pool,
+       ROUND(alloc_bytes/1024/1024/1024, 2)  AS alloc_gb,
+       populate_status
+FROM   gv$inmemory_area
+ORDER  BY inst_id, pool;
+
+------------------------------------------------------------
+-- PHASE 2: SIMULATE PROD ISSUE — Force partial eviction in QA
+-- WARNING: This will temporarily degrade QA performance
+-- Inform QA users before proceeding
+------------------------------------------------------------
+
+-- 12.4 OPTION A — Force eviction of the table from IM entirely
+-- This simulates the table not being in IM = worst case
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME NO INMEMORY;
+
+-- Confirm eviction has happened (may take 30-60 seconds)
+SELECT inst_id,
+       COUNT(*)  AS segments_still_in_im
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+GROUP  BY inst_id;
+-- Target: 0 rows returned = fully evicted
+
+-- 12.5 Run the slow query NOW with IM disabled
+-- Time this execution and record elapsed time
+-- It should be SLOW (matching PROD behavior)
+-- Add GATHER_PLAN_STATISTICS hint to capture actual stats:
+-- SELECT /*+ GATHER_PLAN_STATISTICS */ ... your query here ...
+
+-- Record the slow execution stats
+SELECT sql_id,
+       plan_hash_value,
+       executions,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2)  AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY last_active_time DESC
+FETCH  FIRST 3 ROWS ONLY;
+
+-- Expected: avg_secs >> 1 second, im_scans = 0, disk_reads > 0
+-- This CONFIRMS that without IM = slow = matches PROD behavior
+
+-- 12.6 Check execution plan during slow run
+-- Should show TABLE ACCESS STORAGE FULL (not INMEMORY FULL)
+SELECT *
+FROM   TABLE(
+         DBMS_XPLAN.DISPLAY_CURSOR(
+           sql_id       => '&&SQL_ID',
+           child_number => 0,
+           format       => 'ALLSTATS LAST +PREDICATE +PARTITION'
+         )
+       );
+
+------------------------------------------------------------
+-- OPTION B — Simulate PARTIAL population (closer to PROD state)
+-- More realistic than full eviction
+------------------------------------------------------------
+
+-- 12.7 Re-enable INMEMORY but with LOW priority (slow to populate)
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  INMEMORY PRIORITY NONE;
+
+-- With PRIORITY NONE = only populates on first full table scan
+-- Table is marked INMEMORY but empty = partial state
+
+-- Confirm it shows as INMEMORY enabled but not yet populated
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+ORDER  BY inst_id, partition_name;
+-- Expected: rows show OUT OF MEMORY or STARTED with high not_pop_mb
+
+-- 12.8 Run the slow query immediately after Step 12.7
+-- while population is still in progress
+-- Should be slow due to mixed IM + disk scan
+-- This reproduces the exact PROD scenario
+
+------------------------------------------------------------
+-- PHASE 3: RESTORE QA — Apply the fix and confirm recovery
+------------------------------------------------------------
+
+-- 12.9 Restore INMEMORY with CRITICAL priority
+ALTER TABLE &&SCHEMA_OWNER..&&TABLE_NAME
+  INMEMORY PRIORITY CRITICAL;
+
+-- 12.10 Force immediate repopulation
+-- Use the dynamically generated commands from Step 8.1
+-- Run the output of this query:
+SELECT 'EXEC DBMS_INMEMORY.REPOPULATE('''
+       || owner        || ''','''
+       || segment_name || ''','''
+       || partition_name
+       || ''');'                                    AS repop_cmd,
+       partition_name,
+       ROUND(bytes_not_populated/1024/1024, 2)     AS not_pop_mb
+FROM   gv$im_segments
+WHERE  owner               = '&&SCHEMA_OWNER'
+AND    segment_name        = '&&TABLE_NAME'
+AND    inst_id             = 1
+ORDER  BY bytes_not_populated DESC;
+
+-- 12.11 Monitor repopulation until complete
+-- Re-run until not_pop_mb = 0 for all rows
+SELECT inst_id,
+       segment_name,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024,  2)  AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024,   2)  AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+ORDER  BY inst_id,
+          bytes_not_populated DESC;
+
+-- 12.12 Run the query AGAIN after repopulation completes
+-- Should now be FAST again (< 1 second in QA)
+SELECT sql_id,
+       plan_hash_value,
+       executions,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2)  AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+ORDER  BY last_active_time DESC
+FETCH  FIRST 3 ROWS ONLY;
+
+-- Expected after fix:
+--   avg_secs  = fast (< 1 second in QA)
+--   im_scans  > 0   (IM being used again)
+--   disk_reads = 0   (no more storage reads)
+
+------------------------------------------------------------
+-- PHASE 4: RECORD REGRESSION TEST RESULTS
+------------------------------------------------------------
+
+-- 12.13 Final comparison — fill in results from each phase
+--
+-- PHASE 1 BASELINE (QA before change):
+--   avg_secs  = _______
+--   im_scans  = _______
+--   disk_reads = _______
+--   populate_status = _______
+--
+-- PHASE 2 SIMULATED PROD (QA with IM evicted/partial):
+--   avg_secs  = _______  (should be high = matches PROD)
+--   im_scans  = _______  (should be 0)
+--   disk_reads = _______  (should be high)
+--   Plan shows: TABLE ACCESS STORAGE FULL or TABLE ACCESS FULL
+--
+-- PHASE 3 AFTER FIX (QA with IM restored):
+--   avg_secs  = _______  (should return to fast)
+--   im_scans  = _______  (should be > 0)
+--   disk_reads = _______  (should be 0)
+--   Plan shows: TABLE ACCESS INMEMORY FULL
+--
+-- CONCLUSION:
+-- If Phase 2 is slow AND Phase 3 is fast =
+-- CONFIRMED: IM population state is the root cause
+-- Applying the same fix to PROD will resolve the slowness
+
+
+================================================================================
+STEP 13: VALIDATION — RUN AFTER ALL FIXES APPLIED IN PROD
+================================================================================
+
+-- 13.1 Confirm all partitions fully populated
+SELECT inst_id,
+       COUNT(*)                                        AS total_segments,
+       SUM(CASE WHEN bytes_not_populated = 0
+                AND  populate_status = 'COMPLETED'
+                THEN 1 ELSE 0 END)                    AS fully_populated,
+       SUM(CASE WHEN bytes_not_populated > 0
+                OR   populate_status != 'COMPLETED'
+                THEN 1 ELSE 0 END)                    AS incomplete,
+       ROUND(SUM(bytes_not_populated)/1024/1024, 2)   AS total_not_pop_mb
+FROM   gv$im_segments
+WHERE  owner        = '&&SCHEMA_OWNER'
+AND    segment_name = '&&TABLE_NAME'
+GROUP  BY inst_id
+ORDER  BY inst_id;
+-- Target: incomplete = 0, total_not_pop_mb = 0 on all instances
+
+-- 13.2 Confirm IM area pool status
+SELECT inst_id,
+       pool,
+       ROUND(alloc_bytes/1024/1024/1024, 2)  AS alloc_gb,
+       populate_status,
+       con_id
+FROM   gv$inmemory_area
+ORDER  BY inst_id, pool;
+
+-- 13.3 Confirm wait events have reduced
+SELECT inst_id,
+       event,
+       total_waits,
+       ROUND(time_waited/100, 2)   AS total_secs,
+       ROUND(average_wait/100, 4)  AS avg_secs
+FROM   gv$system_event
+WHERE  event IN (
+         'IM buffer busy SHR',
+         'enq: IN - contention',
+         'gc cr block 2-way',
+         'gc buffer busy acquire',
+         'cell multiblock physical read'
+       )
+ORDER  BY inst_id, time_waited DESC;
+
+-- 13.4 Confirm slow query is now fast
+SELECT sql_id,
+       child_number,
+       plan_hash_value,
+       executions,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2)  AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%&&SQL_KEYWORD%'
+AND    last_active_time > SYSDATE - 1/24
+ORDER  BY last_active_time DESC
+FETCH  FIRST 5 ROWS ONLY;
+-- Target: avg_secs < 1, im_scans > 0, disk_reads = 0
+
+-- 13.5 Final IM space summary
+SELECT inst_id,
+       owner,
+       COUNT(*)                                        AS segments,
+       ROUND(SUM(inmemory_size)/1024/1024/1024,   2)  AS inmem_gb,
+       ROUND(SUM(bytes_not_populated)/1024/1024,  2)  AS not_pop_mb,
+       SUM(CASE WHEN populate_status = 'COMPLETED'
+                THEN 1 ELSE 0 END)                    AS completed
+FROM   gv$im_segments
+GROUP  BY inst_id, owner
+ORDER  BY inst_id, inmem_gb DESC;
+
+
+================================================================================
+STEP 14: ONGOING MONITORING
+================================================================================
+
+-- 14.1 Quick daily health check
+SELECT inst_id,
+       pool,
+       ROUND(alloc_bytes/1024/1024/1024, 2)  AS alloc_gb,
+       populate_status
+FROM   gv$inmemory_area
+ORDER  BY inst_id, pool;
+
+-- 14.2 Watch for incomplete segments
+SELECT inst_id,
+       owner,
+       segment_name,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2)  AS not_pop_mb
+FROM   gv$im_segments
+WHERE  bytes_not_populated > 0
+    OR populate_status != 'COMPLETED'
+ORDER  BY bytes_not_populated DESC NULLS LAST;
+
+-- 14.3 Watch for IM contention building up
+SELECT inst_id,
+       event,
+       total_waits,
+       ROUND(average_wait/100, 4)  AS avg_wait_secs
+FROM   gv$system_event
+WHERE  event IN (
+         'IM buffer busy SHR',
+         'enq: IN - contention',
+         'gc cr block 2-way'
+       )
+AND    total_waits > 0
+ORDER  BY inst_id, total_waits DESC;
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+  PLACEHOLDERS TO REPLACE:
+  ─────────────────────────────────────────────────────────────────────────────
+  &&SCHEMA_OWNER    = Schema owner of the target table
+  &&TABLE_NAME      = Large partitioned table name
+  &&VIEW_TABLE_1    = First view in the slow query
+  &&VIEW_TABLE_2    = Second view in the slow query
+  &&SQL_KEYWORD     = Unique keyword from slow SQL text
+  &&SQL_ID          = SQL ID from Step 7.1
+  &&GOOD_PLAN_HASH  = Fast plan hash from QA Step 7.4
+  ─────────────────────────────────────────────────────────────────────────────
+
+  ROOT CAUSE CONFIRMED:
+  ─────────────────────────────────────────────────────────────────────────────
+  1. Table subpartitions NOT fully populated in PROD
+     Mixed IM + Exadata scan = cell multiblock physical reads
+  2. enq: IN contention — repopulation happening during queries
+  3. IM buffer busy SHR — too many PQ slaves on same IM extents
+  4. gc cr block 2-way — cross-node RAC access for partial data
+  TB values in GV$INMEMORY_AREA = cumulative counter, NOT the issue
+  ─────────────────────────────────────────────────────────────────────────────
+
+  FIX ORDER:
+  ─────────────────────────────────────────────────────────────────────────────
+  1.  Steps 1-7     Diagnose and confirm
+  2.  Step 12       Run QA regression FIRST to validate theory
+  3.  Fix A         Increase populate servers
+  4.  Fix B         Set CRITICAL priority
+  5.  Fix C         Set DISTRIBUTE BY PARTITION
+  6.  Fix D         Repopulate incomplete partitions
+  7.  Fix E         Reduce parallel degree if needed
+  8.  Step 10       Pin good plan via SQL Plan Baseline if needed
+  9.  Step 13       Validate all fixes in PROD
+  ─────────────────────────────────────────────────────────────────────────────
+
+  WHAT NOT TO DO:
+  ─────────────────────────────────────────────────────────────────────────────
+  - Do NOT gather statistics on the large table during peak hours
+  - Do NOT increase INMEMORY_SIZE without planning a restart window
+  - Do NOT hardcode partition names — always use Step 8 to generate
+  - Do NOT run Phase 2 of Step 12 without warning QA users first
+  ─────────────────────────────────────────────────────────────────────────────
+
+================================================================================
+END OF TROUBLESHOOTING SCRIPT
+================================================================================
+  Notes:
+  1. All scripts require DBA or SELECT_CATALOG_ROLE privilege
+  2. All ALTER TABLE MODIFY PARTITION/SUBPARTITION = online, no downtime
+  3. DBMS_INMEMORY.REPOPULATE = online, no impact to running queries
+  4. DISTRIBUTE BY PARTITION change triggers background repopulation
+  5. Test session-level workarounds (Step 11) before system-level changes
+  6. Always use SID='*' for system parameter changes in RAC
+  7. Run Step 12 QA regression before applying any changes to PROD
+================================================================================
