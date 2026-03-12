@@ -1,3 +1,397 @@
+===C start
+Oracle In-Memory Regression Test - SQL Script Pack (Anonymized)
+
+Purpose
+Provide only the required SQL / SQL*Plus scripts needed to execute the regression test for
+In-Memory eviction, restore, population validation, and execution-plan confirmation in a RAC
+environment. All actual object names have been removed. Replace placeholders before use.
+
+Important placeholders to replace
+  <OWNER_NAME>           Object owner
+  <TABLE_NAME>           Partitioned table name
+  <PARTITION_NAME>       Partition under test
+  <SQL_TEXT_KEYWORD>     Unique keyword from target SQL text
+  <SQL_ID_VALUE>         Optional SQL ID for plan display
+
+================================================================================
+SCRIPT 00 - SQL*Plus session setup
+================================================================================
+
+SET ECHO ON
+SET FEEDBACK ON
+SET HEADING ON
+SET LINESIZE 220
+SET PAGESIZE 200
+SET LONG 100000
+SET LONGCHUNKSIZE 100000
+SET TRIMSPOOL ON
+SET TAB OFF
+SET VERIFY OFF
+SET TIMING ON
+SET SERVEROUTPUT ON SIZE UNLIMITED
+
+COLUMN inst_id               FORMAT 999
+COLUMN owner                 FORMAT A30
+COLUMN segment_name          FORMAT A35
+COLUMN partition_name        FORMAT A30
+COLUMN populate_status       FORMAT A18
+COLUMN inmemory              FORMAT A12
+COLUMN inmemory_priority     FORMAT A18
+COLUMN inmemory_compression  FORMAT A24
+COLUMN inmemory_duplicate    FORMAT A20
+COLUMN sql_id                FORMAT A15
+COLUMN avg_secs              FORMAT 9999990.00
+COLUMN not_pop_mb            FORMAT 999999990.00
+COLUMN inmem_gb              FORMAT 9999990.00
+COLUMN last_active_time      FORMAT A20
+COLUMN plan_table_output     FORMAT A180
+
+PROMPT ================================================================
+PROMPT Oracle In-Memory Regression Test - Anonymized Script Pack
+PROMPT ================================================================
+
+================================================================================
+SCRIPT 01 - Precheck current partition IM state
+================================================================================
+
+SELECT inst_id,
+       owner,
+       segment_name,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb,
+       inmemory_priority,
+       inmemory_duplicate
+FROM   gv$im_segments
+WHERE  owner          = UPPER('<OWNER_NAME>')
+AND    segment_name   = UPPER('<TABLE_NAME>')
+AND    partition_name = UPPER('<PARTITION_NAME>')
+ORDER  BY inst_id;
+
+================================================================================
+SCRIPT 02 - Evict target partition from In-Memory
+================================================================================
+
+ALTER TABLE <OWNER_NAME>.<TABLE_NAME>
+  MODIFY PARTITION <PARTITION_NAME>
+  NO INMEMORY;
+
+================================================================================
+SCRIPT 03 - Validate full eviction
+Run repeatedly until this returns 0 rows.
+================================================================================
+
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner          = UPPER('<OWNER_NAME>')
+AND    segment_name   = UPPER('<TABLE_NAME>')
+AND    partition_name = UPPER('<PARTITION_NAME>')
+ORDER  BY inst_id;
+
+PROMPT Expected result: 0 rows before proceeding.
+
+================================================================================
+SCRIPT 04 - Re-enable partition in IM with target attributes
+================================================================================
+
+ALTER TABLE <OWNER_NAME>.<TABLE_NAME>
+  MODIFY PARTITION <PARTITION_NAME>
+  INMEMORY
+  PRIORITY CRITICAL
+  MEMCOMPRESS FOR QUERY LOW
+  DUPLICATE ALL;
+
+================================================================================
+SCRIPT 05 - Verify dictionary attributes after re-enable
+================================================================================
+
+SELECT partition_name,
+       inmemory,
+       inmemory_priority,
+       inmemory_compression,
+       inmemory_duplicate
+FROM   dba_tab_partitions
+WHERE  table_owner    = UPPER('<OWNER_NAME>')
+AND    table_name     = UPPER('<TABLE_NAME>')
+AND    partition_name = UPPER('<PARTITION_NAME>');
+
+PROMPT Expected values:
+PROMPT   INMEMORY              = ENABLED
+PROMPT   INMEMORY_PRIORITY     = CRITICAL
+PROMPT   INMEMORY_COMPRESSION  = FOR QUERY LOW
+PROMPT   INMEMORY_DUPLICATE    = DUPLICATE ALL
+
+================================================================================
+SCRIPT 06 - Monitor population progress
+Run repeatedly until 2 rows are returned, COMPLETED on both, and bytes_not_populated = 0.
+================================================================================
+
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb,
+       inmemory_priority,
+       inmemory_duplicate
+FROM   gv$im_segments
+WHERE  owner                  = UPPER('<OWNER_NAME>')
+AND    segment_name           = UPPER('<TABLE_NAME>')
+AND    partition_name         = UPPER('<PARTITION_NAME>')
+AND    populate_status        = 'COMPLETED'
+AND    bytes_not_populated    = 0
+ORDER  BY inst_id;
+
+PROMPT Expected result in RAC: 2 rows.
+PROMPT Do not run confirmation timing until both rows appear.
+
+================================================================================
+SCRIPT 07 - Baseline capture for IM state
+================================================================================
+
+SELECT inst_id,
+       partition_name,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb,
+       inmemory_priority,
+       inmemory_duplicate
+FROM   gv$im_segments
+WHERE  owner          = UPPER('<OWNER_NAME>')
+AND    segment_name   = UPPER('<TABLE_NAME>')
+AND    partition_name = UPPER('<PARTITION_NAME>')
+ORDER  BY inst_id;
+
+================================================================================
+SCRIPT 08 - Find recent target SQL in shared pool
+Use a unique keyword from the SQL text.
+================================================================================
+
+SELECT sql_id,
+       plan_hash_value,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2) AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       executions,
+       TO_CHAR(last_active_time, 'YYYY-MM-DD HH24:MI:SS') AS last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%' || LOWER('<SQL_TEXT_KEYWORD>') || '%'
+ORDER  BY last_active_time DESC
+FETCH FIRST 10 ROWS ONLY;
+
+================================================================================
+SCRIPT 09 - Execute target application query with plan stats enabled
+Replace the SELECT below with the real query text.
+================================================================================
+
+SELECT /*+ GATHER_PLAN_STATISTICS */
+       *
+FROM   <OWNER_NAME>.<TABLE_NAME>
+WHERE  1 = 0;
+
+PROMPT Replace SCRIPT 09 with the real target query before execution.
+PROMPT Keep GATHER_PLAN_STATISTICS hint in place.
+
+================================================================================
+SCRIPT 10 - Review recent SQL performance after execution
+================================================================================
+
+SELECT sql_id,
+       plan_hash_value,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2) AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       executions,
+       TO_CHAR(last_active_time, 'YYYY-MM-DD HH24:MI:SS') AS last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%' || LOWER('<SQL_TEXT_KEYWORD>') || '%'
+ORDER  BY last_active_time DESC
+FETCH FIRST 3 ROWS ONLY;
+
+================================================================================
+SCRIPT 11 - Display actual execution plan by SQL_ID
+================================================================================
+
+SELECT *
+FROM   TABLE(DBMS_XPLAN.DISPLAY_CURSOR('<SQL_ID_VALUE>', NULL, 'ALLSTATS LAST +PEEKED_BINDS +OUTLINE'));
+
+PROMPT Replace <SQL_ID_VALUE> with the SQL_ID from SCRIPT 10.
+
+================================================================================
+SCRIPT 12 - Fast helper to confirm IM usage vs storage usage
+================================================================================
+
+SELECT sql_id,
+       plan_hash_value,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2) AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets
+FROM   v$sql
+WHERE  sql_id = '<SQL_ID_VALUE>';
+
+================================================================================
+SCRIPT 13 - Optional combined wait loop for full population in RAC
+This PL/SQL block polls until both instances are ready or timeout is reached.
+================================================================================
+
+DECLARE
+  l_count         NUMBER;
+  l_max_minutes   NUMBER := 30;
+  l_sleep_seconds NUMBER := 60;
+  l_elapsed_loops NUMBER := 0;
+BEGIN
+  LOOP
+    SELECT COUNT(*)
+    INTO   l_count
+    FROM   gv$im_segments
+    WHERE  owner               = UPPER('<OWNER_NAME>')
+    AND    segment_name        = UPPER('<TABLE_NAME>')
+    AND    partition_name      = UPPER('<PARTITION_NAME>')
+    AND    populate_status     = 'COMPLETED'
+    AND    bytes_not_populated = 0;
+
+    DBMS_OUTPUT.PUT_LINE('Ready row count = ' || l_count ||
+                         ' at ' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS'));
+
+    EXIT WHEN l_count = 2;
+
+    l_elapsed_loops := l_elapsed_loops + 1;
+    IF l_elapsed_loops >= (l_max_minutes * 60 / l_sleep_seconds) THEN
+      RAISE_APPLICATION_ERROR(-20001, 'Timeout waiting for full IM population on both RAC instances.');
+    END IF;
+
+    DBMS_LOCK.SLEEP(l_sleep_seconds);
+  END LOOP;
+END;
+/
+
+================================================================================
+SCRIPT 14 - Optional combined wait loop for full eviction
+This PL/SQL block polls until the partition fully disappears from GV$IM_SEGMENTS.
+================================================================================
+
+DECLARE
+  l_count         NUMBER;
+  l_max_minutes   NUMBER := 20;
+  l_sleep_seconds NUMBER := 30;
+  l_elapsed_loops NUMBER := 0;
+BEGIN
+  LOOP
+    SELECT COUNT(*)
+    INTO   l_count
+    FROM   gv$im_segments
+    WHERE  owner          = UPPER('<OWNER_NAME>')
+    AND    segment_name   = UPPER('<TABLE_NAME>')
+    AND    partition_name = UPPER('<PARTITION_NAME>');
+
+    DBMS_OUTPUT.PUT_LINE('Remaining IM rows = ' || l_count ||
+                         ' at ' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS'));
+
+    EXIT WHEN l_count = 0;
+
+    l_elapsed_loops := l_elapsed_loops + 1;
+    IF l_elapsed_loops >= (l_max_minutes * 60 / l_sleep_seconds) THEN
+      RAISE_APPLICATION_ERROR(-20002, 'Timeout waiting for full IM eviction.');
+    END IF;
+
+    DBMS_LOCK.SLEEP(l_sleep_seconds);
+  END LOOP;
+END;
+/
+
+================================================================================
+SCRIPT 15 - Minimal end-state validation summary
+================================================================================
+
+PROMPT ==================== END-STATE CHECK ====================
+
+SELECT inst_id,
+       populate_status,
+       ROUND(bytes_not_populated/1024/1024, 2) AS not_pop_mb,
+       ROUND(inmemory_size/1024/1024/1024, 2) AS inmem_gb
+FROM   gv$im_segments
+WHERE  owner          = UPPER('<OWNER_NAME>')
+AND    segment_name   = UPPER('<TABLE_NAME>')
+AND    partition_name = UPPER('<PARTITION_NAME>')
+ORDER  BY inst_id;
+
+SELECT sql_id,
+       plan_hash_value,
+       ROUND(elapsed_time/1000000/NULLIF(executions,0), 2) AS avg_secs,
+       im_scans,
+       disk_reads,
+       buffer_gets,
+       executions,
+       TO_CHAR(last_active_time, 'YYYY-MM-DD HH24:MI:SS') AS last_active_time
+FROM   v$sql
+WHERE  LOWER(sql_text) LIKE '%' || LOWER('<SQL_TEXT_KEYWORD>') || '%'
+ORDER  BY last_active_time DESC
+FETCH FIRST 3 ROWS ONLY;
+
+================================================================================
+SUGGESTED RUN ORDER
+================================================================================
+
+1. SCRIPT 00
+2. SCRIPT 01
+3. SCRIPT 02
+4. SCRIPT 03 or SCRIPT 14
+5. SCRIPT 04
+6. SCRIPT 05
+7. SCRIPT 06 or SCRIPT 13
+8. SCRIPT 07
+9. SCRIPT 08
+10. SCRIPT 09
+11. SCRIPT 10
+12. SCRIPT 11
+13. Repeat SCRIPT 02 + SCRIPT 03 + SCRIPT 09 + SCRIPT 10 + SCRIPT 11 for eviction test if needed
+14. SCRIPT 04 + SCRIPT 05 + SCRIPT 06 + SCRIPT 09 + SCRIPT 10 + SCRIPT 11 for restore confirmation
+15. SCRIPT 15
+
+================================================================================
+NOTES
+================================================================================
+
+1. The original plan requires eviction to be confirmed by waiting until the IM rows disappear,
+   then re-enable with PRIORITY CRITICAL and DUPLICATE ALL, validate dictionary attributes,
+   and only proceed once both RAC instances show COMPLETED with bytes_not_populated = 0.
+2. The performance checks rely on V$SQL metrics such as avg_secs, im_scans, disk_reads,
+   and plan confirmation through DBMS_XPLAN.
+3. The original plan explicitly warns that COMPLETED alone is not sufficient; bytes_not_populated
+   must also be 0 before timing is trusted.
+
+
+
+
+===C end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ===============\\\
 
 Yes, absolutely. Here's exactly how to simulate partial partition removal from IM in QA.
