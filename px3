@@ -1,0 +1,285 @@
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.session_serial#,
+       ash.instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.instance_number
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.session_serial#,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (PARTITION BY ash.session_id, ash.session_serial#), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.session_id IN (&slave1,&slave2,&slave3)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          ash.session_serial#,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+       ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+ORDER  BY ash.sample_time, ash.session_id;
+
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+SELECT ash.sql_plan_line_id,
+       ash.session_id,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.sql_plan_line_id = &plan_line_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id, ash.session_id
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.event = 'direct path read temp'
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
+
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.session_serial#,
+       ash.instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.instance_number
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.session_serial#,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (PARTITION BY ash.session_id, ash.session_serial#), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.session_id IN (&slave1,&slave2,&slave3)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          ash.session_serial#,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+       ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+ORDER  BY ash.sample_time, ash.session_id;
+
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+SELECT ash.sql_plan_line_id,
+       ash.session_id,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.sql_plan_line_id = &plan_line_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id, ash.session_id
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = &qc_session_id
+  AND  ash.qc_instance_id = &qc_instance_id
+  AND  ash.event = 'direct path read temp'
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
