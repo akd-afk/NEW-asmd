@@ -1,206 +1,285 @@
-Here's a structured 5-phase framework. The diagram maps the decision flow, followed by the specific AWR SQL for each phase.---
-
-### Phase 1 — Baseline execution profile
-
-Establish how the SQL has been executing across snapshots: elapsed time, executions, actual vs. requested DOP, and row volume.
-
-```sql
--- Execution profile over time for a given SQL_ID
-SELECT s.snap_id,
-       TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI') AS snap_time,
-       ss.executions_delta                                  AS execs,
-       ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_elapsed_s,
-       ROUND(ss.cpu_time_delta     / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_cpu_s,
-       ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_io_wait_s,
-       ss.rows_processed_delta                             AS total_rows,
-       ss.px_servers_execs_delta                          AS px_server_execs,
-       -- actual DOP implied from PX server execs vs SQL execs
-       ROUND(ss.px_servers_execs_delta / NULLIF(ss.executions_delta,0), 0)   AS implied_dop
-FROM   dba_hist_sqlstat ss
-JOIN   dba_hist_snapshot sn ON ss.snap_id = sn.snap_id AND ss.dbid = sn.dbid
-WHERE  ss.sql_id = '&sql_id'
-  AND  ss.dbid   = (SELECT dbid FROM v$database)
-ORDER  BY ss.snap_id;
-```
-
----
-
-### Phase 2 — Plan stability and DOP drift
-
-Identify how many distinct execution plans exist across the AWR window and whether the DOP is being honored.
-
-```sql
--- Plan hash versions with their DOP and cost
-SELECT sp.plan_hash_value,
-       MIN(TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI')) AS first_seen,
-       MAX(TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI')) AS last_seen,
-       COUNT(DISTINCT ss.snap_id)                               AS snap_count,
-       SUM(ss.executions_delta)                                 AS total_execs,
-       -- requested DOP from the plan
-       MAX(CASE WHEN sp.operation='SELECT STATEMENT' THEN sp.other_xml END) AS plan_dop_xml
-FROM   dba_hist_sqlstat ss
-JOIN   dba_hist_snapshot sn ON ss.snap_id = sn.snap_id AND ss.dbid = sn.dbid
-JOIN   dba_hist_sql_plan  sp ON ss.sql_id = sp.sql_id
-                             AND ss.plan_hash_value = sp.plan_hash_value
-                             AND ss.dbid = sp.dbid
-WHERE  ss.sql_id = '&sql_id'
-  AND  ss.dbid   = (SELECT dbid FROM v$database)
-GROUP  BY sp.plan_hash_value
-ORDER  BY total_execs DESC;
-
--- Highlight parallel operations in the winning plan
-SELECT operation, options, object_name,
-       cost, cardinality, bytes,
-       TRIM(other_tag)   AS distribution,
-       degree            AS object_degree,
-       TRIM(other_xml)   AS px_detail
-FROM   dba_hist_sql_plan
-WHERE  sql_id        = '&sql_id'
-  AND  plan_hash_value = &plan_hash_value
-  AND  dbid          = (SELECT dbid FROM v$database)
-ORDER  BY id;
-```
-
----
-
-### Phase 3 — PX server activity via ASH
-
-Drill into ASH to see what PX slaves were actually doing during executions of this SQL.
-
-```sql
--- Top wait events for this SQL across QC and PX slaves
-SELECT ash.session_type,
-       ash.event,
-       ash.wait_class,
-       COUNT(*)                                     AS ash_samples,
-       ROUND(COUNT(*) * 10 / 60, 1)                AS est_wait_min,
-       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
-FROM   dba_hist_active_sess_history ash
-WHERE  ash.sql_id = '&sql_id'
-  AND  ash.dbid   = (SELECT dbid FROM v$database)
-  AND  ash.sample_time BETWEEN TO_DATE('&start_time','YYYY-MM-DD HH24:MI')
-                            AND TO_DATE('&end_time','YYYY-MM-DD HH24:MI')
-GROUP  BY ash.session_type, ash.event, ash.wait_class
-ORDER  BY ash_samples DESC
-FETCH  FIRST 20 ROWS ONLY;
-
--- PX slave breakdown: samples per slave process
 SELECT ash.qc_session_id,
        ash.qc_instance_id,
        ash.session_id,
+       ash.session_serial#,
        ash.instance_number,
-       ash.event,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.instance_number
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.session_serial#,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (PARTITION BY ash.session_id, ash.session_serial#), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.session_id IN (&slave1,&slave2,&slave3)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          ash.session_serial#,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
        COUNT(*) AS samples
 FROM   dba_hist_active_sess_history ash
-WHERE  ash.sql_id    = '&sql_id'
-  AND  ash.dbid      = (SELECT dbid FROM v$database)
-  AND  ash.qc_session_id IS NOT NULL    -- PX slave rows only
-  AND  ash.sample_time BETWEEN TO_DATE('&start_time','YYYY-MM-DD HH24:MI')
-                            AND TO_DATE('&end_time','YYYY-MM-DD HH24:MI')
-GROUP  BY ash.qc_session_id, ash.qc_instance_id,
-          ash.session_id, ash.instance_number, ash.event
-ORDER  BY samples DESC
-FETCH  FIRST 30 ROWS ONLY;
-```
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
 
----
-
-### Phase 4 — Skew and inter-process contention
-
-Detect worker skew (some slaves idle while others are saturated) and heavy `PX Deq` / send-receive waits.
-
-```sql
--- Worker skew: min vs max samples per slave set (same QC session)
-SELECT qc_session_id,
-       qc_instance_id,
-       COUNT(DISTINCT session_id)  AS slave_count,
-       MIN(slave_samples)          AS min_slave_samples,
-       MAX(slave_samples)          AS max_slave_samples,
-       ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples),0), 1) AS skew_ratio
-FROM (
-  SELECT qc_session_id, qc_instance_id, session_id,
-         COUNT(*) AS slave_samples
-  FROM   dba_hist_active_sess_history
-  WHERE  sql_id   = '&sql_id'
-    AND  dbid     = (SELECT dbid FROM v$database)
-    AND  qc_session_id IS NOT NULL
-    AND  sample_time BETWEEN TO_DATE('&start_time','YYYY-MM-DD HH24:MI')
-                         AND TO_DATE('&end_time','YYYY-MM-DD HH24:MI')
-  GROUP  BY qc_session_id, qc_instance_id, session_id
-)
-GROUP  BY qc_session_id, qc_instance_id
-ORDER  BY skew_ratio DESC NULLS LAST;
-
--- PX-specific wait events (send/receive/credit/buffer)
-SELECT event,
-       COUNT(*)                                         AS samples,
-       ROUND(AVG(time_waited), 2)                       AS avg_us,
-       ROUND(MAX(time_waited) / 1000, 1)                AS max_ms
-FROM   dba_hist_active_sess_history
-WHERE  sql_id    = '&sql_id'
-  AND  dbid      = (SELECT dbid FROM v$database)
-  AND  event LIKE 'PX%'
-  AND  sample_time BETWEEN TO_DATE('&start_time','YYYY-MM-DD HH24:MI')
-                       AND TO_DATE('&end_time','YYYY-MM-DD HH24:MI')
-GROUP  BY event
-ORDER  BY samples DESC;
-```
-
----
-
-### Phase 5 — Resource starvation and RAC affinity
-
-Check whether DOP was downgraded due to pool exhaustion and whether PX traffic is crossing RAC instances inefficiently.
-
-```sql
--- DOP requested vs. actual from AWR SQL stats
--- px_servers_execs / executions = actual avg PX servers per exec
--- compare to the DEGREE in the plan for requested DOP
-SELECT ss.snap_id,
-       sn.end_interval_time,
-       ss.executions_delta                                              AS execs,
-       ss.px_servers_execs_delta                                       AS total_px_svr_execs,
-       ROUND(ss.px_servers_execs_delta / NULLIF(ss.executions_delta,0),1) AS actual_avg_dop,
-       sp.degree                                                        AS plan_degree_on_object
-FROM   dba_hist_sqlstat  ss
-JOIN   dba_hist_snapshot sn ON ss.snap_id = sn.snap_id AND ss.dbid = sn.dbid
-JOIN   (SELECT DISTINCT sql_id, plan_hash_value, degree
-        FROM   dba_hist_sql_plan
-        WHERE  sql_id  = '&sql_id'
-          AND  degree IS NOT NULL
-          AND  degree <> '1') sp
-       ON ss.sql_id = sp.sql_id AND ss.plan_hash_value = sp.plan_hash_value
-WHERE  ss.sql_id  = '&sql_id'
-  AND  ss.dbid    = (SELECT dbid FROM v$database)
-  AND  ss.executions_delta > 0
-ORDER  BY ss.snap_id;
-
--- Cross-instance PX activity (RAC): QC on instance X, slaves on instance Y
-SELECT ash.instance_number          AS slave_instance,
-       ash.qc_instance_id           AS qc_instance,
-       COUNT(*)                     AS samples,
-       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+SELECT TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+       ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state
 FROM   dba_hist_active_sess_history ash
-WHERE  ash.sql_id          = '&sql_id'
-  AND  ash.dbid            = (SELECT dbid FROM v$database)
-  AND  ash.qc_session_id  IS NOT NULL
-  AND  ash.sample_time BETWEEN TO_DATE('&start_time','YYYY-MM-DD HH24:MI')
-                           AND TO_DATE('&end_time','YYYY-MM-DD HH24:MI')
-GROUP  BY ash.instance_number, ash.qc_instance_id
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+ORDER  BY ash.sample_time, ash.session_id;
+
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
 ORDER  BY samples DESC;
-```
 
----
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
 
-### Quick interpretation guide
+SELECT ash.sql_plan_line_id,
+       ash.session_id,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.sql_plan_line_id = &plan_line_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id, ash.session_id
+ORDER  BY samples DESC;
 
-| Finding | Likely cause | Next action |
-|---|---|---|
-| Multiple plan hashes, DOP varies | Adaptive plan, cardinality feedback, stale stats | Pin plan via SQL profile / baseline |
-| High `PX Deq Credit: send blocked` | Consumer slower than producer; buffer pressure | Tune consumer operation, check PGA, reduce DOP |
-| High `PX Deq: Table Q Normal` | Normal granule wait — acceptable in small doses | Check if slaves are truly busy or idle (skew query) |
-| Skew ratio > 3× | Data distribution imbalance; hot key in hash join | Review distribution method in plan (`HASH` vs `RANGE`), update column stats |
-| Actual DOP < plan DOP | `parallel_max_servers` hit; pool exhausted | Check `V$PQ_SYSSTAT`, consider `PARALLEL_DEGREE_POLICY=MANUAL` and explicit hint |
-| All slaves on remote instance | RAC affinity not set; cross-instance messaging overhead | Use `PARALLEL_INSTANCE_GROUP` or service-level affinity |
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 2453
+  AND  ash.qc_instance_id = 2
+  AND  ash.event = 'direct path read temp'
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 05:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 09:30','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
 
-Work through all five phases in order — the most common root causes (plan instability and DOP downgrade) surface early, so you can often stop before Phase 4.
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.session_serial#,
+       ash.instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.instance_number
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.session_serial#,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (PARTITION BY ash.session_id, ash.session_serial#), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.session_id IN (&slave1,&slave2,&slave3)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          ash.session_serial#,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id,
+          NVL(ash.event, 'ON CPU'),
+          ash.wait_class
+ORDER  BY ash.session_id, samples DESC;
+
+SELECT TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+       ash.session_id,
+       NVL(ash.event, 'ON CPU') AS state
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.session_id IN (&heavy_slave,&light_slave)
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+ORDER  BY ash.sample_time, ash.session_id;
+
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+SELECT ash.sql_plan_line_id,
+       ash.session_id,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.sql_plan_line_id = &plan_line_id
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id, ash.session_id
+ORDER  BY samples DESC;
+
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = 1224
+  AND  ash.qc_instance_id = 2
+  AND  ash.event = 'direct path read temp'
+  AND  ash.sample_time BETWEEN TO_DATE('2026-03-21 21:00','YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('2026-03-21 22:00','YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
