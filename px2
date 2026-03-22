@@ -1,0 +1,172 @@
+SELECT ss.instance_number,
+       ss.snap_id,
+       TO_CHAR(sn.end_interval_time, 'YYYY-MM-DD HH24:MI') AS snap_time,
+       ss.executions_delta AS execs,
+       ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta, 0) / 1e6, 2) AS avg_elapsed_s,
+       ROUND(ss.cpu_time_delta     / NULLIF(ss.executions_delta, 0) / 1e6, 2) AS avg_cpu_s,
+       ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta, 0) / 1e6, 2) AS avg_io_wait_s,
+       ss.rows_processed_delta AS total_rows,
+       ss.px_servers_execs_delta AS px_server_execs,
+       ROUND(ss.px_servers_execs_delta / NULLIF(ss.executions_delta, 0), 0) AS implied_dop
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.sql_id = '&sql_id'
+  AND  ss.dbid   = (SELECT dbid FROM v$database)
+ORDER  BY ss.instance_number, ss.snap_id;
+
+WITH ss_agg AS (
+  SELECT ss.dbid,
+         ss.sql_id,
+         ss.plan_hash_value,
+         MIN(sn.end_interval_time) AS first_seen,
+         MAX(sn.end_interval_time) AS last_seen,
+         COUNT(DISTINCT ss.instance_number || ':' || ss.snap_id) AS snap_count,
+         SUM(ss.executions_delta) AS total_execs
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.sql_id = '&sql_id'
+    AND  ss.dbid   = (SELECT dbid FROM v$database)
+  GROUP  BY ss.dbid, ss.sql_id, ss.plan_hash_value
+)
+SELECT a.plan_hash_value,
+       TO_CHAR(a.first_seen, 'YYYY-MM-DD HH24:MI') AS first_seen,
+       TO_CHAR(a.last_seen,  'YYYY-MM-DD HH24:MI') AS last_seen,
+       a.snap_count,
+       a.total_execs,
+       DBMS_LOB.SUBSTR(p.other_xml, 4000, 1) AS root_other_xml
+FROM   ss_agg a
+LEFT JOIN dba_hist_sql_plan p
+       ON p.dbid = a.dbid
+      AND p.sql_id = a.sql_id
+      AND p.plan_hash_value = a.plan_hash_value
+      AND p.id = 0
+ORDER  BY a.total_execs DESC;
+
+SELECT id,
+       parent_id,
+       operation,
+       options,
+       object_owner,
+       object_name,
+       cost,
+       cardinality,
+       bytes,
+       TRIM(other_tag) AS distribution,
+       CASE
+         WHEN other_xml IS NOT NULL THEN DBMS_LOB.SUBSTR(other_xml, 4000, 1)
+       END AS px_detail
+FROM   dba_hist_sql_plan
+WHERE  sql_id = '&sql_id'
+  AND  plan_hash_value = &plan_hash_value
+  AND  dbid = (SELECT dbid FROM v$database)
+ORDER  BY id;
+
+SELECT ash.session_type,
+       ash.event,
+       ash.wait_class,
+       COUNT(*) AS ash_samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_wait_min,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid   = (SELECT dbid FROM v$database)
+  AND  ash.sample_time BETWEEN TO_DATE('&start_time', 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('&end_time',   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_type, ash.event, ash.wait_class
+ORDER  BY ash_samples DESC
+FETCH FIRST 20 ROWS ONLY;
+
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.instance_number,
+       ash.event,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid   = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('&start_time', 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('&end_time',   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.instance_number,
+          ash.event
+ORDER  BY samples DESC
+FETCH FIRST 30 ROWS ONLY;
+
+SELECT qc_session_id,
+       qc_instance_id,
+       COUNT(DISTINCT session_id) AS slave_count,
+       MIN(slave_samples) AS min_slave_samples,
+       MAX(slave_samples) AS max_slave_samples,
+       ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples), 0), 1) AS skew_ratio
+FROM (
+  SELECT qc_session_id,
+         qc_instance_id,
+         session_id,
+         COUNT(*) AS slave_samples
+  FROM   dba_hist_active_sess_history
+  WHERE  sql_id = '&sql_id'
+    AND  dbid = (SELECT dbid FROM v$database)
+    AND  qc_session_id IS NOT NULL
+    AND  sample_time BETWEEN TO_DATE('&start_time', 'YYYY-MM-DD HH24:MI')
+                         AND TO_DATE('&end_time',   'YYYY-MM-DD HH24:MI')
+  GROUP  BY qc_session_id, qc_instance_id, session_id
+)
+GROUP  BY qc_session_id, qc_instance_id
+ORDER  BY skew_ratio DESC NULLS LAST;
+
+SELECT event,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history
+WHERE  sql_id = '&sql_id'
+  AND  dbid = (SELECT dbid FROM v$database)
+  AND  event LIKE 'PX%'
+  AND  sample_time BETWEEN TO_DATE('&start_time', 'YYYY-MM-DD HH24:MI')
+                       AND TO_DATE('&end_time',   'YYYY-MM-DD HH24:MI')
+GROUP  BY event
+ORDER  BY samples DESC;
+
+SELECT ss.instance_number,
+       ss.snap_id,
+       TO_CHAR(sn.end_interval_time, 'YYYY-MM-DD HH24:MI') AS snap_time,
+       ss.executions_delta AS execs,
+       ss.px_servers_execs_delta AS total_px_svr_execs,
+       ROUND(ss.px_servers_execs_delta / NULLIF(ss.executions_delta, 0), 1) AS actual_avg_px_servers_per_exec,
+       DBMS_LOB.SUBSTR(sp.other_xml, 4000, 1) AS root_other_xml
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ss.dbid
+      AND sp.sql_id = ss.sql_id
+      AND sp.plan_hash_value = ss.plan_hash_value
+      AND sp.id = 0
+WHERE  ss.sql_id = '&sql_id'
+  AND  ss.dbid   = (SELECT dbid FROM v$database)
+  AND  ss.executions_delta > 0
+ORDER  BY ss.instance_number, ss.snap_id;
+
+SELECT ash.instance_number AS slave_instance,
+       ash.qc_instance_id AS qc_instance,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('&start_time', 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE('&end_time',   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.instance_number, ash.qc_instance_id
+ORDER  BY samples DESC;
