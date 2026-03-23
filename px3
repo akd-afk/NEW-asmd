@@ -1,3 +1,26 @@
+@px_postmortem_one.sql <sql_id> BAD_WINDOW 2026-03-21_05:00 2026-03-21_09:30 AUTO AUTO
+
+@px_postmortem_one.sql <sql_id> GOOD_WINDOW 2026-03-21_21:00 2026-03-21_22:00 AUTO AUTO
+
+@px_postmortem_one.sql <sql_id> BAD_RUN_1 2026-03-21_05:00 2026-03-21_09:30 AUTO AUTO
+@px_postmortem_one.sql <sql_id> GOOD_RUN_1 2026-03-21_21:00 2026-03-21_22:00 AUTO AUTO
+
+@px_postmortem_one.sql <sql_id> BAD_WINDOW_MAR21 2026-03-21_05:00 2026-03-21_09:30 AUTO AUTO
+
+@px_postmortem_one.sql <sql_id> GOOD_WINDOW_MAR21 2026-03-21_21:00 2026-03-21_22:00 AUTO AUTO
+
+@px_postmortem_one.sql <sql_id> BAD_WINDOW 2026-03-21_05:00 2026-03-21_09:30 <qc_session_id> <qc_instance_id>
+
+@px_postmortem_one.sql <sql_id> GOOD_WINDOW 2026-03-21_21:00 2026-03-21_22:00 <qc_session_id> <qc_instance_id>
+
+@px_postmortem_one.sql <sql_id> BAD_RUN_FIXED_QC 2026-03-21_05:00 2026-03-21_09:30 <qc_session_id> <qc_instance_id>
+@px_postmortem_one.sql <sql_id> GOOD_RUN_FIXED_QC 2026-03-21_21:00 2026-03-21_22:00 <qc_session_id> <qc_instance_id>
+
+@px_postmortem_one.sql <sql_id> BAD_WINDOW_0500_0930 2026-03-21_05:00 2026-03-21_09:30 AUTO AUTO
+
+@px_postmortem_one.sql <sql_id> GOOD_WINDOW_2100_2200 2026-03-21_21:00 2026-03-21_22:00 AUTO AUTO
+
+
 SELECT ash.qc_session_id,
        ash.qc_instance_id,
        ash.session_id,
