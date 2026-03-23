@@ -1,3 +1,27 @@
+
+Here are both.
+
+1. Short executive summary for leadership
+
+We reviewed the affected SQL executions with Oracle and confirmed the queries are running in parallel. The current issue does not appear to be lack of parallelism. Instead, the slow runs show a strong imbalance across parallel workers, where one worker continues processing significantly longer than the others, which drives the overall delay.
+
+Oracle’s current working theory is that the slowdown may be tied to uneven data distribution during the load phase of the query, potentially causing one parallel worker to receive disproportionately more work. At this stage, that theory is directionally consistent with what we observed, but it is not yet fully proven because similar data inputs have completed normally in other runs.
+
+The next steps are to provide Oracle with the good-run AWR data for comparison, continue side-by-side review of good versus bad executions, and further analyze whether data distribution, partition behavior, or a product issue is contributing to the skew. Oracle is continuing to investigate on the same path.
+
+2. Crisp Oracle SR comment you can paste directly
+
+Based on today’s review, we aligned on the following observations and next steps.
+
+We confirmed that the affected SQL is running in parallel and that the issue is not simply absence of PX. Across the bad executions, the main pattern we see is severe PX worker imbalance, where one slave continues processing significantly longer than the rest, while the other slaves complete earlier or become comparatively idle. In the good executions, the work distribution appears much more even across slaves.
+
+From the SQL Monitor and related review, the current focus appears to be the load phase of the execution, where the skew is most visible. The working theory discussed on the call is that uneven data distribution may be causing one slave to receive disproportionately more work. That said, we also noted that similar bind/date inputs have completed normally in other runs, so we do not yet consider a pure static data-skew explanation fully proven.
+
+As follow-up, we will provide the good-period AWR dump and any additional good-run evidence available for direct comparison against the bad period. We also request that Oracle document the findings from the PX/QC/skew review directly in the SR, including whether the behavior aligns with data skew, partition/distribution imbalance, adaptive/runtime behavior, or any known product issue. Please also advise on any recommended tactical mitigation while the deeper analysis continues.
+
+If you want, I can make the leadership version even shorter, like 4 lines for Teams.
+
+
 SET PAGESIZE 5000
 SET LINESIZE 300
 SET LONG 1000000
