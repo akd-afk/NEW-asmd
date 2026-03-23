@@ -1,0 +1,432 @@
+SET PAGESIZE 5000
+SET LINESIZE 300
+SET LONG 1000000
+SET LONGCHUNKSIZE 1000000
+SET TRIMSPOOL ON
+SET TAB OFF
+SET VERIFY OFF
+SET FEEDBACK ON
+SET SERVEROUTPUT ON
+ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+
+DEFINE sql_id='&1'
+DEFINE label='&2'
+DEFINE start_ts='&3'
+DEFINE end_ts='&4'
+DEFINE user_qc_sid='&5'
+DEFINE user_qc_inst='&6'
+
+COLUMN selected_qc_sid NEW_VALUE selected_qc_sid NOPRINT
+COLUMN selected_qc_inst NEW_VALUE selected_qc_inst NOPRINT
+
+COLUMN sql_id FORMAT A15
+COLUMN label FORMAT A20
+COLUMN begin_snap FORMAT A16
+COLUMN end_snap FORMAT A16
+COLUMN first_seen FORMAT A19
+COLUMN last_seen FORMAT A19
+COLUMN state FORMAT A35
+COLUMN wait_class FORMAT A20
+COLUMN operation FORMAT A30
+COLUMN options FORMAT A25
+COLUMN object_owner FORMAT A20
+COLUMN object_name FORMAT A35
+
+SELECT CASE
+         WHEN UPPER('&&user_qc_sid') <> 'AUTO' THEN '&&user_qc_sid'
+         ELSE NVL(
+                (
+                  SELECT TO_CHAR(qc_session_id)
+                  FROM (
+                    SELECT ash.qc_session_id,
+                           ash.qc_instance_id,
+                           COUNT(*) AS samples,
+                           ROW_NUMBER() OVER (
+                             ORDER BY COUNT(*) DESC, ash.qc_instance_id, ash.qc_session_id
+                           ) AS rn
+                    FROM   dba_hist_active_sess_history ash
+                    WHERE  ash.sql_id = '&&sql_id'
+                      AND  ash.dbid = (SELECT dbid FROM v$database)
+                      AND  ash.qc_session_id IS NOT NULL
+                      AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                                               AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+                    GROUP  BY ash.qc_session_id, ash.qc_instance_id
+                  )
+                  WHERE rn = 1
+                ),
+                '0'
+              )
+       END AS selected_qc_sid,
+       CASE
+         WHEN UPPER('&&user_qc_inst') <> 'AUTO' THEN '&&user_qc_inst'
+         ELSE NVL(
+                (
+                  SELECT TO_CHAR(qc_instance_id)
+                  FROM (
+                    SELECT ash.qc_session_id,
+                           ash.qc_instance_id,
+                           COUNT(*) AS samples,
+                           ROW_NUMBER() OVER (
+                             ORDER BY COUNT(*) DESC, ash.qc_instance_id, ash.qc_session_id
+                           ) AS rn
+                    FROM   dba_hist_active_sess_history ash
+                    WHERE  ash.sql_id = '&&sql_id'
+                      AND  ash.dbid = (SELECT dbid FROM v$database)
+                      AND  ash.qc_session_id IS NOT NULL
+                      AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                                               AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+                    GROUP  BY ash.qc_session_id, ash.qc_instance_id
+                  )
+                  WHERE rn = 1
+                ),
+                '0'
+              )
+       END AS selected_qc_inst
+FROM dual;
+
+PROMPT ===============================================================================
+PROMPT PX POST-MORTEM REPORT
+PROMPT SQL_ID           : &&sql_id
+PROMPT LABEL            : &&label
+PROMPT START_TS         : &&start_ts
+PROMPT END_TS           : &&end_ts
+PROMPT SELECTED_QC_SID  : &&selected_qc_sid
+PROMPT SELECTED_QC_INST : &&selected_qc_inst
+PROMPT ===============================================================================
+
+PROMPT
+PROMPT [01] WINDOW EXECUTION PROFILE FROM DBA_HIST_SQLSTAT
+SELECT ss.instance_number,
+       ss.snap_id,
+       TO_CHAR(sn.begin_interval_time, 'YYYY-MM-DD HH24:MI') AS begin_snap,
+       TO_CHAR(sn.end_interval_time,   'YYYY-MM-DD HH24:MI') AS end_snap,
+       ss.executions_delta AS execs,
+       ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta, 0) / 1e6, 2) AS avg_elapsed_s,
+       ROUND(ss.cpu_time_delta     / NULLIF(ss.executions_delta, 0) / 1e6, 2) AS avg_cpu_s,
+       ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta, 0) / 1e6, 2) AS avg_iowait_s,
+       ss.rows_processed_delta AS total_rows,
+       ss.px_servers_execs_delta AS px_server_execs
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.sql_id = '&&sql_id'
+  AND  ss.dbid = (SELECT dbid FROM v$database)
+  AND  sn.end_interval_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                               AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+ORDER  BY ss.instance_number, ss.snap_id;
+
+PROMPT
+PROMPT [02] WINDOW AGGREGATE FROM DBA_HIST_SQLSTAT
+SELECT '&&sql_id' AS sql_id,
+       '&&label'  AS label,
+       SUM(ss.executions_delta) AS execs,
+       ROUND(SUM(ss.elapsed_time_delta) / NULLIF(SUM(ss.executions_delta), 0) / 1e6, 2) AS avg_elapsed_s,
+       ROUND(SUM(ss.cpu_time_delta)     / NULLIF(SUM(ss.executions_delta), 0) / 1e6, 2) AS avg_cpu_s,
+       ROUND(SUM(ss.iowait_delta)       / NULLIF(SUM(ss.executions_delta), 0) / 1e6, 2) AS avg_iowait_s,
+       SUM(ss.rows_processed_delta) AS total_rows,
+       SUM(ss.px_servers_execs_delta) AS px_server_execs
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.sql_id = '&&sql_id'
+  AND  ss.dbid = (SELECT dbid FROM v$database)
+  AND  sn.end_interval_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                               AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI');
+
+PROMPT
+PROMPT [03] PLAN HASHES SEEN IN WINDOW
+SELECT ss.plan_hash_value,
+       MIN(sn.end_interval_time) AS first_seen,
+       MAX(sn.end_interval_time) AS last_seen,
+       SUM(ss.executions_delta) AS execs
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.sql_id = '&&sql_id'
+  AND  ss.dbid = (SELECT dbid FROM v$database)
+  AND  sn.end_interval_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                               AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ss.plan_hash_value
+ORDER  BY execs DESC, first_seen;
+
+PROMPT
+PROMPT [04] TOP ASH EVENTS IN WINDOW
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [05] QC CANDIDATES IN WINDOW
+SELECT ash.qc_instance_id,
+       ash.qc_session_id,
+       COUNT(*) AS samples,
+       COUNT(DISTINCT ash.session_id) AS px_slave_count,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_instance_id, ash.qc_session_id
+ORDER  BY samples DESC, ash.qc_instance_id, ash.qc_session_id;
+
+PROMPT
+PROMPT [06] SKEW SUMMARY BY QC
+SELECT qc_session_id,
+       qc_instance_id,
+       COUNT(DISTINCT session_id) AS slave_count,
+       MIN(slave_samples) AS min_slave_samples,
+       MAX(slave_samples) AS max_slave_samples,
+       ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples), 0), 1) AS skew_ratio
+FROM (
+  SELECT ash.qc_session_id,
+         ash.qc_instance_id,
+         ash.session_id,
+         COUNT(*) AS slave_samples
+  FROM   dba_hist_active_sess_history ash
+  WHERE  ash.sql_id = '&&sql_id'
+    AND  ash.dbid = (SELECT dbid FROM v$database)
+    AND  ash.qc_session_id IS NOT NULL
+    AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                             AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+  GROUP  BY ash.qc_session_id, ash.qc_instance_id, ash.session_id
+)
+GROUP  BY qc_session_id, qc_instance_id
+ORDER  BY skew_ratio DESC NULLS LAST, slave_count DESC, qc_instance_id, qc_session_id;
+
+PROMPT
+PROMPT [07] PX SLAVE SAMPLE DISTRIBUTION FOR SELECTED QC
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.session_serial#,
+       ash.instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.instance_number
+ORDER  BY samples DESC, ash.instance_number, ash.session_id;
+
+PROMPT
+PROMPT [08] PX STATE / WAIT PROFILE FOR SELECTED QC
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [09] HOT PLAN LINES FOR SELECTED QC
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC, ash.sql_plan_line_id;
+
+PROMPT
+PROMPT [10] HOTTEST PLAN LINE BY SLAVE FOR SELECTED QC
+WITH hot_line AS (
+  SELECT sql_plan_line_id
+  FROM (
+    SELECT ash.sql_plan_line_id,
+           COUNT(*) AS samples,
+           ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC, ash.sql_plan_line_id) AS rn
+    FROM   dba_hist_active_sess_history ash
+    WHERE  ash.sql_id = '&&sql_id'
+      AND  ash.dbid = (SELECT dbid FROM v$database)
+      AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+      AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+      AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                               AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+    GROUP  BY ash.sql_plan_line_id
+  )
+  WHERE rn = 1
+)
+SELECT ash.sql_plan_line_id,
+       ash.session_id,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+JOIN   hot_line hl
+       ON hl.sql_plan_line_id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id, ash.session_id
+ORDER  BY samples DESC, ash.session_id;
+
+PROMPT
+PROMPT [11] TEMP-HEAVY SLAVES FOR SELECTED QC
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+  AND  ash.event IN ('direct path read temp', 'direct path write temp')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC, ash.session_id, ash.sql_plan_line_id;
+
+PROMPT
+PROMPT [12] CROSS-INSTANCE PX ACTIVITY FOR SELECTED QC
+SELECT ash.instance_number AS slave_instance,
+       ash.qc_instance_id AS qc_instance,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER('&&selected_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&selected_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.instance_number, ash.qc_instance_id
+ORDER  BY samples DESC, ash.instance_number;
+
+PROMPT
+PROMPT [13] ROOT PLAN XML FOR PLAN HASHES SEEN IN WINDOW
+WITH phv AS (
+  SELECT DISTINCT ss.plan_hash_value
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.sql_id = '&&sql_id'
+    AND  ss.dbid = (SELECT dbid FROM v$database)
+    AND  sn.end_interval_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+)
+SELECT p.plan_hash_value,
+       DBMS_LOB.SUBSTR(p.other_xml, 4000, 1) AS root_other_xml
+FROM   dba_hist_sql_plan p
+JOIN   phv
+       ON phv.plan_hash_value = p.plan_hash_value
+WHERE  p.dbid = (SELECT dbid FROM v$database)
+  AND  p.sql_id = '&&sql_id'
+  AND  p.id = 0
+ORDER  BY p.plan_hash_value;
+
+PROMPT
+PROMPT [14] QUICK SUMMARY ROW
+WITH execs AS (
+  SELECT SUM(ss.executions_delta) AS execs,
+         ROUND(SUM(ss.elapsed_time_delta) / NULLIF(SUM(ss.executions_delta), 0) / 1e6, 2) AS avg_elapsed_s,
+         ROUND(SUM(ss.cpu_time_delta)     / NULLIF(SUM(ss.executions_delta), 0) / 1e6, 2) AS avg_cpu_s,
+         ROUND(SUM(ss.iowait_delta)       / NULLIF(SUM(ss.executions_delta), 0) / 1e6, 2) AS avg_iowait_s
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.sql_id = '&&sql_id'
+    AND  ss.dbid = (SELECT dbid FROM v$database)
+    AND  sn.end_interval_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+),
+ash_evt AS (
+  SELECT ROUND(100 * SUM(CASE WHEN ash.event IS NULL THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS on_cpu_pct,
+         ROUND(100 * SUM(CASE WHEN ash.event IN ('direct path read temp', 'direct path write temp') THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS temp_pct
+  FROM   dba_hist_active_sess_history ash
+  WHERE  ash.sql_id = '&&sql_id'
+    AND  ash.dbid = (SELECT dbid FROM v$database)
+    AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                             AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+),
+skew AS (
+  SELECT MAX(skew_ratio) AS top_skew_ratio
+  FROM (
+    SELECT ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples), 0), 1) AS skew_ratio
+    FROM (
+      SELECT ash.qc_session_id,
+             ash.qc_instance_id,
+             ash.session_id,
+             COUNT(*) AS slave_samples
+      FROM   dba_hist_active_sess_history ash
+      WHERE  ash.sql_id = '&&sql_id'
+        AND  ash.dbid = (SELECT dbid FROM v$database)
+        AND  ash.qc_session_id IS NOT NULL
+        AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 AND TO_DATE(REPLACE('&&end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+      GROUP  BY ash.qc_session_id, ash.qc_instance_id, ash.session_id
+    )
+    GROUP  BY qc_session_id, qc_instance_id
+  )
+)
+SELECT '&&sql_id' AS sql_id,
+       '&&label'  AS label,
+       NVL(execs.execs, 0) AS execs,
+       NVL(execs.avg_elapsed_s, 0) AS avg_elapsed_s,
+       NVL(execs.avg_cpu_s, 0) AS avg_cpu_s,
+       NVL(execs.avg_iowait_s, 0) AS avg_iowait_s,
+       NVL(ash_evt.on_cpu_pct, 0) AS on_cpu_pct,
+       NVL(ash_evt.temp_pct, 0) AS temp_pct,
+       NVL(skew.top_skew_ratio, 0) AS top_skew_ratio
+FROM   execs, ash_evt, skew;
