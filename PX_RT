@@ -1,0 +1,379 @@
+Example 1: last several hours, auto-pick QC
+
+@px_realtime_one.sql <sql_id> LIVE_WINDOW 2026-03-23_00:00 2026-03-23_03:00 AUTO AUTO
+
+Example 2: tighter live window, auto-pick QC
+
+@px_realtime_one.sql <sql_id> LIVE_TIGHT 2026-03-23_01:00 2026-03-23_02:30 AUTO AUTO
+
+Example 3: execution started recently and backend is still slow
+
+@px_realtime_one.sql <sql_id> LIVE_NOW 2026-03-23_01:30 2026-03-23_03:00 AUTO AUTO
+
+Example 4: same time window, fixed QC
+
+@px_realtime_one.sql <sql_id> LIVE_FIXED_QC 2026-03-23_01:30 2026-03-23_03:00 <qc_session_id> <qc_instance_id>
+
+Example 5: broader live capture to be safe
+
+@px_realtime_one.sql <sql_id> LIVE_BROAD 2026-03-22_23:30 2026-03-23_03:00 AUTO AUTO
+
+Example 6: bad window style, auto-pick QC
+
+@px_realtime_one.sql <sql_id> BAD_WINDOW 2026-03-21_05:00 2026-03-21_09:30 AUTO AUTO
+
+Example 7: good window style, auto-pick QC
+
+@px_realtime_one.sql <sql_id> GOOD_WINDOW 2026-03-21_21:00 2026-03-21_22:00 AUTO AUTO
+
+Example 8: bad vs good back to back
+
+@px_realtime_one.sql <sql_id> BAD_WINDOW 2026-03-21_05:00 2026-03-21_09:30 AUTO AUTO
+@px_realtime_one.sql <sql_id> GOOD_WINDOW 2026-03-21_21:00 2026-03-21_22:00 AUTO AUTO
+
+Example 9: bad window with fixed QC
+
+@px_realtime_one.sql <sql_id> BAD_WINDOW_FIXED_QC 2026-03-21_05:00 2026-03-21_09:30 <qc_session_id> <qc_instance_id>
+
+Example 10: good window with fixed QC
+
+@px_realtime_one.sql <sql_id> GOOD_WINDOW_FIXED_QC 2026-03-21_21:00 2026-03-21_22:00 <qc_session_id> <qc_instance_id>
+
+
+SET PAGESIZE 5000
+SET LINESIZE 300
+SET LONG 200000
+SET LONGCHUNKSIZE 200000
+SET TRIMSPOOL ON
+SET TAB OFF
+SET FEEDBACK ON
+SET VERIFY OFF
+SET HEADING ON
+SET SERVEROUTPUT ON
+ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+
+DEFINE p_sql_id='&1'
+DEFINE p_label='&2'
+DEFINE p_start_ts='&3'
+DEFINE p_end_ts='&4'
+DEFINE p_qc_sid='&5'
+DEFINE p_qc_inst='&6'
+
+COLUMN v_qc_sid NEW_VALUE v_qc_sid NOPRINT
+COLUMN v_qc_inst NEW_VALUE v_qc_inst NOPRINT
+
+SELECT CASE
+         WHEN UPPER('&&p_qc_sid') = 'AUTO' THEN TO_CHAR(qc_session_id)
+         ELSE '&&p_qc_sid'
+       END AS v_qc_sid,
+       CASE
+         WHEN UPPER('&&p_qc_inst') = 'AUTO' THEN TO_CHAR(qc_instance_id)
+         ELSE '&&p_qc_inst'
+       END AS v_qc_inst
+FROM (
+  SELECT ash.qc_session_id,
+         ash.qc_instance_id,
+         COUNT(*) AS samples
+  FROM   gv$active_session_history ash
+  WHERE  ash.sql_id = '&&p_sql_id'
+    AND  ash.qc_session_id IS NOT NULL
+    AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                             AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+  GROUP  BY ash.qc_session_id, ash.qc_instance_id
+  ORDER  BY samples DESC
+)
+WHERE ROWNUM = 1;
+
+PROMPT ============================================================================
+PROMPT PX REAL-TIME REPORT
+PROMPT SQL_ID      : &&p_sql_id
+PROMPT LABEL       : &&p_label
+PROMPT START_TS    : &&p_start_ts
+PROMPT END_TS      : &&p_end_ts
+PROMPT QC_SELECTED : &&v_qc_sid / &&v_qc_inst
+PROMPT ============================================================================
+
+COLUMN sql_exec_start FORMAT A19
+COLUMN first_seen FORMAT A19
+COLUMN last_seen FORMAT A19
+COLUMN state FORMAT A35
+COLUMN event FORMAT A40
+COLUMN wait_class FORMAT A18
+COLUMN operation FORMAT A30
+COLUMN options FORMAT A25
+COLUMN object_owner FORMAT A20
+COLUMN object_name FORMAT A35
+COLUMN status FORMAT A12
+COLUMN username FORMAT A20
+COLUMN machine FORMAT A30
+COLUMN module FORMAT A30
+COLUMN service_name FORMAT A20
+
+PROMPT
+PROMPT [1] SQL MONITOR EXECUTION SUMMARY
+SELECT m.inst_id,
+       m.sid AS qc_session_id,
+       m.session_serial#,
+       m.sql_exec_id,
+       TO_CHAR(m.sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') AS sql_exec_start,
+       m.status,
+       ROUND(m.elapsed_time / 1e6, 2) AS elapsed_s,
+       ROUND(m.cpu_time / 1e6, 2) AS cpu_s,
+       ROUND(m.user_io_wait_time / 1e6, 2) AS io_wait_s,
+       m.buffer_gets,
+       m.disk_reads,
+       m.px_servers_requested,
+       m.px_servers_allocated,
+       m.sql_plan_hash_value,
+       m.module,
+       m.service_name
+FROM   gv$sql_monitor m
+WHERE  m.sql_id = '&&p_sql_id'
+  AND  m.sql_exec_start BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                            AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+ORDER  BY m.sql_exec_start, m.inst_id, m.sid;
+
+PROMPT
+PROMPT [2] QC DISCOVERY IN WINDOW
+SELECT ash.qc_instance_id,
+       ash.qc_session_id,
+       COUNT(*) AS samples,
+       COUNT(DISTINCT ash.session_id) AS px_slave_count,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_instance_id, ash.qc_session_id
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [3] TOP EVENTS IN WINDOW
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.session_type,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.session_type, ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [4] SKEW SUMMARY FOR SELECTED QC
+SELECT qc_session_id,
+       qc_instance_id,
+       COUNT(DISTINCT session_id) AS slave_count,
+       MIN(slave_samples) AS min_slave_samples,
+       MAX(slave_samples) AS max_slave_samples,
+       ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples), 0), 1) AS skew_ratio
+FROM (
+  SELECT ash.qc_session_id,
+         ash.qc_instance_id,
+         ash.session_id,
+         COUNT(*) AS slave_samples
+  FROM   gv$active_session_history ash
+  WHERE  ash.sql_id = '&&p_sql_id'
+    AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+    AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+    AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                             AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+  GROUP  BY ash.qc_session_id, ash.qc_instance_id, ash.session_id
+)
+GROUP  BY qc_session_id, qc_instance_id;
+
+PROMPT
+PROMPT [5] PX SLAVE DISTRIBUTION
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.session_serial#,
+       ash.inst_id AS slave_inst_id,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.inst_id
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [6] PX STATE / WAIT PROFILE
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [7] HOT PLAN LINES
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   gv$active_session_history ash
+LEFT JOIN gv$sql_plan sp
+       ON sp.inst_id = ash.inst_id
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [8] HOTTEST PLAN LINE BY SLAVE
+WITH hot_line AS (
+  SELECT sql_plan_line_id
+  FROM (
+    SELECT ash.sql_plan_line_id,
+           COUNT(*) AS samples
+    FROM   gv$active_session_history ash
+    WHERE  ash.sql_id = '&&p_sql_id'
+      AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+      AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+      AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                               AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+    GROUP  BY ash.sql_plan_line_id
+    ORDER  BY samples DESC
+  )
+  WHERE ROWNUM = 1
+)
+SELECT ash.sql_plan_line_id,
+       ash.session_id,
+       COUNT(*) AS samples
+FROM   gv$active_session_history ash
+JOIN   hot_line h
+       ON h.sql_plan_line_id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.sql_plan_line_id, ash.session_id
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [9] TEMP-HEAVY SLAVES
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+  AND  ash.event IN ('direct path read temp', 'direct path write temp')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
+
+PROMPT
+PROMPT [10] CROSS-INSTANCE PX ACTIVITY
+SELECT ash.inst_id AS slave_inst_id,
+       ash.qc_instance_id AS qc_inst_id,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&&p_sql_id'
+  AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+  AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+  AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                           AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+GROUP  BY ash.inst_id, ash.qc_instance_id
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [11] REAL-TIME PLAN HASHES IN WINDOW
+SELECT m.inst_id,
+       m.sid AS qc_session_id,
+       m.sql_exec_id,
+       m.sql_plan_hash_value,
+       TO_CHAR(m.sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') AS sql_exec_start,
+       m.status,
+       ROUND(m.elapsed_time / 1e6, 2) AS elapsed_s
+FROM   gv$sql_monitor m
+WHERE  m.sql_id = '&&p_sql_id'
+  AND  m.sql_exec_start BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                            AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+ORDER  BY m.sql_exec_start, m.inst_id, m.sid;
+
+PROMPT
+PROMPT [12] QUICK SUMMARY
+WITH evt AS (
+  SELECT ROUND(
+           100 * SUM(CASE WHEN ash.event IS NULL THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0)
+         , 1) AS on_cpu_pct,
+         ROUND(
+           100 * SUM(CASE WHEN ash.event IN ('direct path read temp', 'direct path write temp') THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0)
+         , 1) AS temp_pct
+  FROM   gv$active_session_history ash
+  WHERE  ash.sql_id = '&&p_sql_id'
+    AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+    AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+    AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                             AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+),
+sk AS (
+  SELECT ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples), 0), 1) AS skew_ratio
+  FROM (
+    SELECT ash.session_id,
+           COUNT(*) AS slave_samples
+    FROM   gv$active_session_history ash
+    WHERE  ash.sql_id = '&&p_sql_id'
+      AND  ash.qc_session_id = TO_NUMBER('&&v_qc_sid')
+      AND  ash.qc_instance_id = TO_NUMBER('&&v_qc_inst')
+      AND  ash.sample_time BETWEEN TO_DATE(REPLACE('&&p_start_ts','_',' '), 'YYYY-MM-DD HH24:MI')
+                               AND TO_DATE(REPLACE('&&p_end_ts','_',' '),   'YYYY-MM-DD HH24:MI')
+    GROUP  BY ash.session_id
+  )
+)
+SELECT '&&p_sql_id' AS sql_id,
+       '&&p_label' AS label,
+       '&&v_qc_sid' AS qc_sid,
+       '&&v_qc_inst' AS qc_inst,
+       evt.on_cpu_pct,
+       evt.temp_pct,
+       sk.skew_ratio
+FROM   evt, sk;
+
+UNDEFINE p_sql_id
+UNDEFINE p_label
+UNDEFINE p_start_ts
+UNDEFINE p_end_ts
+UNDEFINE p_qc_sid
+UNDEFINE p_qc_inst
+UNDEFINE v_qc_sid
+UNDEFINE v_qc_inst
