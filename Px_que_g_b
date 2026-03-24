@@ -1,3 +1,26 @@
+imagehistory
+grep -RinE "Starting|Completed|Success|Failed|Error" /var/log/cellos/dbnodeupdate* 2>/dev/null
+systemctl status ctm_agent --no-pager -l
+journalctl -u ctm_agent --since "7 days ago" --no-pager | egrep -i "java|AG_JAVA_HOME|failed|started successfully"
+java -version
+readlink -f /etc/alternatives/jre_11
+alternatives --display java
+grep -RinE "INSTALLATION_TYPE|Patch|NEW|upgrade|reinstall|uninstall" /home/ctm_agent/ctm/install
+find /home/ctm_agent/ctm -xdev -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort | tail -50
+find /home/ctm_agent/ctm/cm/DBCM/data -type f | egrep "CTMDB_accounts.xml|profile|profiles"
+
+
+
+find /home/ctm_agent/ctm/install -maxdepth 2 -type f -name "trace.log" -ls
+grep -RinE "Starting installation|INSTALLATION_TYPE|Patch|NEW|upgrade|reinstall|uninstall" /home/ctm_agent/ctm/install
+
+
+
+ls -ltr /home/ctm_agent/ctm/proclog
+grep -RinE "AG_JAVA_HOME|java|failed|error|success" /home/ctm_agent/ctm/proclog
+
+==========
+
 #!/bin/bash
 
 DB_GROUP=~/dbs_group
