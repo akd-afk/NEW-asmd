@@ -1,12 +1,6 @@
+
 #!/bin/bash
 
-# Validate input
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <FPP_IP1> [FPP_IP2 ...]"
-  exit 1
-fi
-
-# Groups
 DB_GROUP=~/dbs_group
 CELL_GROUP=/root/cell_group
 
@@ -20,34 +14,21 @@ if [[ ! -f "$CELL_GROUP" ]]; then
   exit 1
 fi
 
-FPP_IPS=("$@")
-
-# Build remote command
-build_cmd() {
-  local cmd=""
-  cmd+='echo ==== $(hostname) ====; '
-  cmd+='hostname -f; '
-  cmd+='echo --- IP ADDR ---; '
-  cmd+='ip -br addr; '
-  cmd+='echo --- ROUTES ---; '
-  cmd+='ip route; '
-
-  for ip in "${FPP_IPS[@]}"; do
-    cmd+="echo --- ROUTE TO FPP ($ip) ---; "
-    cmd+="ip route get $ip 2>&1; "
-  done
-
-  cmd+='echo;'
-  echo "$cmd"
-}
-
-REMOTE_CMD="$(build_cmd)"
+REMOTE_CMD='
+echo "===== HOST: $(hostname) ====="
+hostname
+hostname -f
+echo "--- IPv4 ADDRESSES ---"
+ip -o -4 addr show | awk "$2 != \"lo\" && $2 !~ /^ib/ {print \$2, \$4}"
+echo
+'
 
 echo "===== DB NODES ====="
 dcli -g "$DB_GROUP" -l root "$REMOTE_CMD"
 
 echo "===== CELL NODES ====="
 dcli -g "$CELL_GROUP" -l root "$REMOTE_CMD"
+
 
 We will be doing full downtime patching on Exadata, so DBs will be down and there will be no app traffic during the cutover. But patching is driven via a central patching server, and we will also have folks connected over the admin network while working.
 
