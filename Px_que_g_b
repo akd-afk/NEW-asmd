@@ -1,4 +1,18 @@
 
+
+
+We will be doing full downtime patching on Exadata, so DBs will be down and there will be no app traffic during the cutover. But patching is driven via a central patching server, and we will also have folks connected over the admin network while working.
+
+Few things we want to confirm:
+	•	During the gateway switch, since some packet drops were mentioned, should we expect SSH sessions to drop or reset, including connections from the patching server?
+	•	Any chance of partial connectivity for a bit, like ping works but sessions are flaky?
+	•	Roughly how long after cutover until things are fully stable?
+	•	Will there be a clear network is good signal before we start bringing systems back up?
+	•	Would you recommend we pause any active work during the cutover window?
+	•	Also can you share the tentative timeline for the cutover and validation steps?
+
+Just want to avoid any weird issues mid patching or during startup.
+
 Here are both.
 
 1. Short executive summary for leadership
