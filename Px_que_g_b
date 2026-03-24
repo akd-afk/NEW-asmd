@@ -1,4 +1,35 @@
+#!/bin/bash
 
+DB_GROUP=~/dbs_group
+CELL_GROUP=/root/cell_group
+
+if [[ ! -f "$DB_GROUP" ]]; then
+  echo "ERROR: $DB_GROUP not found"
+  exit 1
+fi
+
+if [[ ! -f "$CELL_GROUP" ]]; then
+  echo "ERROR: $CELL_GROUP not found"
+  exit 1
+fi
+
+REMOTE_CMD='
+echo "===== HOST: $(hostname) ====="
+hostname
+hostname -f
+echo "--- IPv4 ADDRESSES ---"
+ip -o -4 addr show | awk '"'"'$2 != "lo" && $2 !~ /^ib/ {print $2, $4}'"'"'
+echo
+'
+
+echo "===== DB NODES ====="
+dcli -g "$DB_GROUP" -l root "$REMOTE_CMD"
+
+echo "===== CELL NODES ====="
+dcli -g "$CELL_GROUP" -l root "$REMOTE_CMD"
+
+
+-----
 #!/bin/bash
 
 DB_GROUP=~/dbs_group
