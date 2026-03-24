@@ -1,26 +1,29 @@
 #!/bin/bash
 
-# Provide one or more FPP IPs as arguments
-# Example: ./dci_collect.sh 10.10.10.10 10.20.20.20
-
+# Validate input
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <FPP_IP1> [FPP_IP2 ... FPP_IPn]"
+  echo "Usage: $0 <FPP_IP1> [FPP_IP2 ...]"
   exit 1
 fi
 
-if [[ ! -f ~/dbs_group ]]; then
-  echo "ERROR: ~/dbs_group not found"
+# Groups
+DB_GROUP=~/dbs_group
+CELL_GROUP=/root/cell_group
+
+if [[ ! -f "$DB_GROUP" ]]; then
+  echo "ERROR: $DB_GROUP not found"
   exit 1
 fi
 
-if [[ ! -f /root/cell_group ]]; then
-  echo "ERROR: /root/cell_group not found"
+if [[ ! -f "$CELL_GROUP" ]]; then
+  echo "ERROR: $CELL_GROUP not found"
   exit 1
 fi
 
 FPP_IPS=("$@")
 
-build_remote_cmd() {
+# Build remote command
+build_cmd() {
   local cmd=""
   cmd+='echo ==== $(hostname) ====; '
   cmd+='hostname -f; '
@@ -28,22 +31,23 @@ build_remote_cmd() {
   cmd+='ip -br addr; '
   cmd+='echo --- ROUTES ---; '
   cmd+='ip route; '
+
   for ip in "${FPP_IPS[@]}"; do
     cmd+="echo --- ROUTE TO FPP ($ip) ---; "
     cmd+="ip route get $ip 2>&1; "
   done
+
   cmd+='echo;'
   echo "$cmd"
 }
 
-REMOTE_CMD="$(build_remote_cmd)"
+REMOTE_CMD="$(build_cmd)"
 
 echo "===== DB NODES ====="
-dcli -g ~/dbs_group -l root "$REMOTE_CMD"
+dcli -g "$DB_GROUP" -l root "$REMOTE_CMD"
 
 echo "===== CELL NODES ====="
-dcli -g /root/cell_group -l root "$REMOTE_CMD"
-
+dcli -g "$CELL_GROUP" -l root "$REMOTE_CMD"
 
 We will be doing full downtime patching on Exadata, so DBs will be down and there will be no app traffic during the cutover. But patching is driven via a central patching server, and we will also have folks connected over the admin network while working.
 
