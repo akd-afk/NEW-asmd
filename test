@@ -1,3 +1,11 @@
+We have engaged Oracle and provided the relevant diagnostics for detailed review. Their analysis is still underway, including the additional data shared after the latest troubleshooting session.
+
+In parallel, we are progressing internal reproduction efforts using a SELECT-only form of the affected SQL to safely compare the good and bad execution behavior without introducing target-side writes. This is intended to help isolate whether the degradation originates in the source-side processing or becomes more pronounced during the load path.
+
+At this stage, the working focus remains on intermittent parallel execution imbalance observed during the slow runs. Both Oracle review and internal validation are actively in progress, and we will provide the next update once we have a more definitive outcome or recommended action.
+
+
+
 @px_realtime_one.sql <sql_id> LIVE_NOW 2026-03-23_01:30 2026-03-23_03:00 AUTO AUTO
 
 SET PAGESIZE 5000
