@@ -1,3 +1,1062 @@
+
+-- =============================================================================
+-- File: px_postmortem_one.sql
+-- Purpose:
+--   Single-SQL incident post-mortem and wait-event drilldown.
+--
+-- Supports:
+--   1) HIST mode  -> DBA_HIST_* views for historical analysis
+--   2) CURR mode  -> GV$* views for current / recent in-memory analysis
+--
+-- Usage:
+--   @px_postmortem_one.sql <sql_id> <from_ts> <to_ts> <wait_event_or_dash> <mode>
+--
+-- Examples:
+--   @px_postmortem_one.sql 8f3m2k1n9p0qr 2026-03-21_05:00 2026-03-21_09:30 - HIST
+--   @px_postmortem_one.sql 8f3m2k1n9p0qr 2026-03-25_13:00 2026-03-25_13:20 - CURR
+--   @px_postmortem_one.sql 8f3m2k1n9p0qr 2026-03-21_05:00 2026-03-21_09:30 "db file sequential read" HIST
+--
+-- Timestamp format:
+--   YYYY-MM-DD_HH24:MI
+--
+-- Notes:
+--   - HIST mode requires Diagnostic Pack licensing compliance.
+--   - CURR mode uses current in-memory views and is appropriate for real-time or
+--     very recent analysis while the SQL is still visible in memory.
+--   - Pass dash (-) as the fourth argument when you do not want event drilldown.
+-- =============================================================================
+
+define p_sql_id      = '&&1'
+define p_from_ts_raw = '&&2'
+define p_to_ts_raw   = '&&3'
+define p_wait_event  = '&&4'
+define p_mode        = '&&5'
+define p_top_n       = '15'
+
+set pages 500
+set lines 380
+set long 200000
+set longchunksize 200000
+set trimspool on
+set verify off
+set feedback on
+set echo off
+set tab off
+set serveroutput off
+
+col sql_id                  format a15
+col sql_text                format a150 word_wrapped
+col begin_time              format a20
+col end_time                format a20
+col first_seen              format a20
+col last_seen               format a20
+col mode_chosen             format a8
+col scope_text              format a50
+col event                   format a45
+col event2                  format a65 word_wrapped
+col wait_class              format a18
+col session_state           format a10
+col module                  format a30
+col action                  format a30
+col program                 format a40
+col machine                 format a36
+col session_type            format a12
+col obj                     format a50
+col objt                    format a65
+col sql_plan_op             format a45
+col plan_line               format a110
+col notes                   format a120 word_wrapped
+col recommendation          format a140 word_wrapped
+col pct_of_total            format 990.99
+col pct_child               format a8
+col pct_child_vis           format a12
+col sample_hour             format a16
+col sample_minute           format a16
+col duration_bucket         format a12
+col pointer_text            format a150 word_wrapped
+
+col plan_hash_value         format 999999999999999
+col execs                   format 999999999999
+col sampled_execs           format 999999999
+col total_seconds           format 999999999999
+col aas                     format 9999990.0
+col ash_samples             format 999999999999
+col rows_proc               format 999999999999999
+col ela_sec                 format 999999999999.99
+col cpu_sec                 format 999999999999.99
+col io_sec                  format 999999999999.99
+col cl_sec                  format 999999999999.99
+col ap_sec                  format 999999999999.99
+col cc_sec                  format 999999999999.99
+col avg_ela_ms_per_exec     format 999999999999.99
+col avg_cpu_ms_per_exec     format 999999999999.99
+col avg_lio_per_exec        format 999999999999.99
+col avg_pio_per_exec        format 999999999999.99
+col avg_rows_per_exec       format 999999999999.99
+col px_exec_servers         format 999999999999
+col buffer_gets             format 999999999999999
+col disk_reads              format 999999999999999
+col fetches                 format 999999999999999
+col parse_calls             format 999999999999999
+col distinct_qc             format 999999999
+col distinct_px_sessions    format 999999999
+col line_id                 format 999999
+col parent_id               format 999999
+col window_minutes          format 9999990.99
+col inst_id                 format 999999
+col plan_count              format 999999
+
+prompt =========================================================================
+prompt PX / SQL POST-MORTEM ONE
+prompt =========================================================================
+prompt SQL_ID     : &&p_sql_id
+prompt FROM_TS    : &&p_from_ts_raw
+prompt TO_TS      : &&p_to_ts_raw
+prompt WAIT_EVENT : &&p_wait_event
+prompt MODE       : &&p_mode
+prompt TOP_N      : &&p_top_n
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 0 - INPUT SANITY
+prompt =========================================================================
+
+with p as (
+    select
+        trim('&&p_sql_id') as sql_id,
+        upper(trim('&&p_mode')) as mode_chosen,
+        trim('&&p_wait_event') as wait_event,
+        to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') as from_ts,
+        to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI') as to_ts
+    from dual
+)
+select
+    sql_id,
+    mode_chosen,
+    case
+        when mode_chosen = 'HIST' then 'Historical AWR/ASH analysis'
+        when mode_chosen = 'CURR' then 'Current in-memory ASH / SQL analysis'
+        else 'INVALID MODE - USE HIST OR CURR'
+    end as scope_text,
+    to_char(from_ts, 'YYYY-MM-DD HH24:MI:SS') as begin_time,
+    to_char(to_ts  , 'YYYY-MM-DD HH24:MI:SS') as end_time,
+    round((to_ts - from_ts) * 24 * 60, 2) as window_minutes,
+    case when wait_event = '-' then '<none>' else wait_event end as wait_event
+from p;
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - SQL TEXT (HIST)
+prompt =========================================================================
+
+select sql_id, sql_text
+from   dba_hist_sqltext
+where  upper(trim('&&p_mode')) = 'HIST'
+and    sql_id = trim('&&p_sql_id');
+
+prompt
+prompt =========================================================================
+prompt SECTION 1B - SQL TEXT (CURR)
+prompt =========================================================================
+
+select *
+from (
+    select
+        sql_id,
+        dbms_lob.substr(sql_fulltext, 3000, 1) as sql_text
+    from   gv$sql
+    where  upper(trim('&&p_mode')) = 'CURR'
+    and    sql_id = trim('&&p_sql_id')
+    order  by last_active_time desc nulls last
+)
+where rownum = 1;
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - SUMMARY BY PLAN HASH VALUE (HIST)
+prompt =========================================================================
+
+with p as (
+    select
+        to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') as from_ts,
+        to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI') as to_ts
+    from dual
+),
+snaps as (
+    select s.dbid, s.instance_number, s.snap_id, s.begin_interval_time, s.end_interval_time
+    from   dba_hist_snapshot s, p
+    where  upper(trim('&&p_mode')) = 'HIST'
+    and    s.begin_interval_time <= p.to_ts
+    and    s.end_interval_time   >= p.from_ts
+)
+select
+    s.sql_id,
+    s.plan_hash_value,
+    count(distinct s.snap_id)                                        as snaps_seen,
+    sum(nvl(s.executions_delta,0))                                   as execs,
+    round(sum(nvl(s.elapsed_time_delta,0))/1e6,2)                    as ela_sec,
+    round(sum(nvl(s.cpu_time_delta,0))/1e6,2)                        as cpu_sec,
+    round(sum(nvl(s.iowait_delta,0))/1e6,2)                          as io_sec,
+    round(sum(nvl(s.clwait_delta,0))/1e6,2)                          as cl_sec,
+    round(sum(nvl(s.apwait_delta,0))/1e6,2)                          as ap_sec,
+    round(sum(nvl(s.ccwait_delta,0))/1e6,2)                          as cc_sec,
+    sum(nvl(s.buffer_gets_delta,0))                                  as buffer_gets,
+    sum(nvl(s.disk_reads_delta,0))                                   as disk_reads,
+    sum(nvl(s.rows_processed_delta,0))                               as rows_proc,
+    sum(nvl(s.fetches_delta,0))                                      as fetches,
+    sum(nvl(s.parse_calls_delta,0))                                  as parse_calls,
+    sum(nvl(s.px_servers_execs_delta,0))                             as px_exec_servers,
+    round(sum(nvl(s.elapsed_time_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0)))/1000,2) as avg_ela_ms_per_exec,
+    round(sum(nvl(s.cpu_time_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0)))/1000,2)     as avg_cpu_ms_per_exec,
+    round(sum(nvl(s.buffer_gets_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0))),2)       as avg_lio_per_exec,
+    round(sum(nvl(s.disk_reads_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0))),2)        as avg_pio_per_exec,
+    round(sum(nvl(s.rows_processed_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0))),2)    as avg_rows_per_exec
+from   dba_hist_sqlstat s
+join   snaps sn
+       on sn.dbid = s.dbid
+      and sn.instance_number = s.instance_number
+      and sn.snap_id = s.snap_id
+where  s.sql_id = trim('&&p_sql_id')
+group  by s.sql_id, s.plan_hash_value
+order  by ela_sec desc nulls last, execs desc;
+
+prompt
+prompt =========================================================================
+prompt SECTION 2B - SUMMARY BY PLAN HASH VALUE (CURR)
+prompt =========================================================================
+
+select
+    sql_id,
+    plan_hash_value,
+    sum(nvl(executions,0))            as execs,
+    round(sum(nvl(elapsed_time,0))/1e6,2) as ela_sec,
+    round(sum(nvl(cpu_time,0))/1e6,2)     as cpu_sec,
+    sum(nvl(buffer_gets,0))           as buffer_gets,
+    sum(nvl(disk_reads,0))            as disk_reads,
+    sum(nvl(rows_processed,0))        as rows_proc,
+    sum(nvl(fetches,0))               as fetches,
+    sum(nvl(parse_calls,0))           as parse_calls,
+    sum(nvl(px_servers_executions,0)) as px_exec_servers,
+    round(sum(nvl(elapsed_time,0))/decode(sum(nvl(executions,0)),0,null,sum(nvl(executions,0)))/1000,2) as avg_ela_ms_per_exec,
+    round(sum(nvl(cpu_time,0))/decode(sum(nvl(executions,0)),0,null,sum(nvl(executions,0)))/1000,2)     as avg_cpu_ms_per_exec,
+    round(sum(nvl(buffer_gets,0))/decode(sum(nvl(executions,0)),0,null,sum(nvl(executions,0))),2)       as avg_lio_per_exec,
+    round(sum(nvl(disk_reads,0))/decode(sum(nvl(executions,0)),0,null,sum(nvl(executions,0))),2)        as avg_pio_per_exec,
+    round(sum(nvl(rows_processed,0))/decode(sum(nvl(executions,0)),0,null,sum(nvl(executions,0))),2)    as avg_rows_per_exec
+from   gv$sqlstats
+where  upper(trim('&&p_mode')) = 'CURR'
+and    sql_id = trim('&&p_sql_id')
+group  by sql_id, plan_hash_value
+order  by ela_sec desc nulls last, execs desc;
+
+prompt
+prompt =========================================================================
+prompt SECTION 3 - PLAN INSTABILITY SUMMARY
+prompt =========================================================================
+
+select
+    count(distinct sql_plan_hash_value) as plan_count,
+    min(sql_plan_hash_value)            as min_plan_hash,
+    max(sql_plan_hash_value)            as max_plan_hash
+from (
+    select sql_plan_hash_value
+    from   dba_hist_active_sess_history
+    where  upper(trim('&&p_mode')) = 'HIST'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    union all
+    select sql_plan_hash_value
+    from   gv$active_session_history
+    where  upper(trim('&&p_mode')) = 'CURR'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+);
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - ASH WINDOW OVERVIEW
+prompt =========================================================================
+
+with ash0 as (
+    select instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id, sql_plan_hash_value, sample_time
+    from   dba_hist_active_sess_history
+    where  upper(trim('&&p_mode')) = 'HIST'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    union all
+    select inst_id as instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id, sql_plan_hash_value, sample_time
+    from   gv$active_session_history
+    where  upper(trim('&&p_mode')) = 'CURR'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+)
+select
+    count(*) as ash_samples,
+    count(*) * 10 as total_seconds,
+    round(count(*) * 10 /
+          ((to_date(replace('&&p_to_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') -
+            to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')) * 86400), 1) as aas,
+    count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+                     to_char(sql_exec_start,'YYYYMMDDHH24MISS')||':'||to_char(sql_exec_id)) as sampled_execs,
+    count(distinct sql_plan_hash_value) as distinct_plan_hashes,
+    to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') as first_seen,
+    to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') as last_seen
+from ash0;
+
+prompt
+prompt =========================================================================
+prompt SECTION 5 - TOP EVENTS WITH DECODED WAIT DETAIL
+prompt =========================================================================
+
+select *
+from (
+    with bclass as (
+        select class, rownum r
+        from   v$waitstat
+    ),
+    ash_base as (
+        select
+            instance_number,
+            session_id,
+            session_serial#,
+            sql_exec_start,
+            sql_exec_id,
+            sample_time,
+            session_state,
+            nvl(wait_class,'ON CPU') as wait_class,
+            nvl(
+                event ||
+                case
+                    when event like 'enq%' and session_state = 'WAITING'
+                        then ' [mode=' || bitand(p1, power(2,14)-1) || ']'
+                    when event in (select name from v$event_name where parameter3 = 'class#')
+                        then ' [' ||
+                             case
+                                 when p3 <= (select max(r) from bclass)
+                                     then (select class from bclass where r = p3)
+                                 else 'p3=' || to_char(p3)
+                             end || ']'
+                    else null
+                end,
+                'ON CPU'
+            ) as event2
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select
+            inst_id as instance_number,
+            session_id,
+            session_serial#,
+            sql_exec_start,
+            sql_exec_id,
+            sample_time,
+            session_state,
+            nvl(wait_class,'ON CPU') as wait_class,
+            nvl(
+                event ||
+                case
+                    when event like 'enq%' and session_state = 'WAITING'
+                        then ' [mode=' || bitand(p1, power(2,14)-1) || ']'
+                    when event in (select name from v$event_name where parameter3 = 'class#')
+                        then ' [' ||
+                             case
+                                 when p3 <= (select max(r) from bclass)
+                                     then (select class from bclass where r = p3)
+                                 else 'p3=' || to_char(p3)
+                             end || ']'
+                    else null
+                end,
+                'ON CPU'
+            ) as event2
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    select
+        session_state,
+        wait_class,
+        event2,
+        count(*) * 10 as total_seconds,
+        round(count(*) * 10 /
+              ((to_date(replace('&&p_to_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') -
+                to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')) * 86400), 1) as aas,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen,
+        count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+                         to_char(sql_exec_start,'YYYYMMDDHH24MISS')||':'||to_char(sql_exec_id)) as sampled_execs
+    from   ash_base
+    group  by session_state, wait_class, event2
+    order  by total_seconds desc, wait_class, event2
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 6 - TOP WAIT CLASSES
+prompt =========================================================================
+
+select *
+from (
+    with ash_base as (
+        select sample_time, nvl(wait_class,'ON CPU') as wait_class
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select sample_time, nvl(wait_class,'ON CPU') as wait_class
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    select
+        wait_class,
+        count(*) * 10 as total_seconds,
+        round(count(*) * 10 /
+              ((to_date(replace('&&p_to_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') -
+                to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')) * 86400), 1) as aas,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from   ash_base
+    group  by wait_class
+    order  by total_seconds desc, wait_class
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 7 - HOUR-BY-HOUR SQL / PLAN ACTIVITY
+prompt =========================================================================
+
+with ash_base as (
+    select sample_time, sql_plan_hash_value, instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id
+    from   dba_hist_active_sess_history
+    where  upper(trim('&&p_mode')) = 'HIST'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    union all
+    select sample_time, sql_plan_hash_value, inst_id as instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id
+    from   gv$active_session_history
+    where  upper(trim('&&p_mode')) = 'CURR'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+)
+select
+    to_char(sample_time, 'YYYY-MM-DD HH24')||':00' as sample_hour,
+    sql_plan_hash_value as plan_hash_value,
+    count(*) * 10 as total_seconds,
+    round(count(*) * 10 / 3600, 2) as aas,
+    count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+                     to_char(sql_exec_start,'YYYYMMDDHH24MISS')||':'||to_char(sql_exec_id)) as sampled_execs
+from   ash_base
+group  by to_char(sample_time, 'YYYY-MM-DD HH24')||':00', sql_plan_hash_value
+order  by sample_hour, plan_hash_value;
+
+prompt
+prompt =========================================================================
+prompt SECTION 8 - GEOGRAPHY BY INSTANCE / MODULE / ACTION
+prompt =========================================================================
+
+select *
+from (
+    select
+        instance_number as inst_id,
+        nvl(module,'<null>') as module,
+        nvl(action,'<null>') as action,
+        count(*) * 10 as total_seconds,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from (
+        select instance_number, module, action, sample_time
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select inst_id as instance_number, module, action, sample_time
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    group  by instance_number, module, action
+    order  by total_seconds desc, inst_id, module, action
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 9 - NORMALIZED PROGRAM / MACHINE / SESSION TYPE
+prompt =========================================================================
+
+select *
+from (
+    select
+        case
+            when session_type = 'BACKGROUND' or regexp_like(program, '.*\([PJ]\d+\)')
+                then regexp_replace(substr(program,instr(program,'(')), '\d', 'n')
+            else '(' || regexp_replace(regexp_replace(program, '(.*)@(.*)(\(.*\))', '\1'), '\d', 'n') || ')'
+        end || ' ' as program,
+        nvl(machine,'<null>') as machine,
+        nvl(session_type,'<null>') as session_type,
+        count(*) * 10 as total_seconds,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from (
+        select program, machine, session_type, sample_time
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select program, machine, session_type, sample_time
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    group by
+        case
+            when session_type = 'BACKGROUND' or regexp_like(program, '.*\([PJ]\d+\)')
+                then regexp_replace(substr(program,instr(program,'(')), '\d', 'n')
+            else '(' || regexp_replace(regexp_replace(program, '(.*)@(.*)(\(.*\))', '\1'), '\d', 'n') || ')'
+        end || ' ',
+        machine,
+        session_type
+    order by total_seconds desc, program, machine
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 10 - TOP PLAN OPERATIONS SEEN IN ASH
+prompt =========================================================================
+
+select *
+from (
+    select
+        nvl(sql_plan_operation || ' ' || sql_plan_options, '<null>') as sql_plan_op,
+        count(*) * 10 as total_seconds,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen,
+        count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+                     to_char(sql_exec_start,'YYYYMMDDHH24MISS')||':'||to_char(sql_exec_id)) as sampled_execs
+    from (
+        select instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id, sample_time,
+               sql_plan_operation, sql_plan_options
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select inst_id as instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id, sample_time,
+               sql_plan_operation, sql_plan_options
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    sql_id = trim('&&p_sql_id')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    group  by sql_plan_operation || ' ' || sql_plan_options
+    order  by total_seconds desc, sql_plan_op
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 11 - RAC / PX INDICATORS
+prompt =========================================================================
+
+select
+    count(*) as ash_samples,
+    count(*) * 10 as total_seconds,
+    sum(case when qc_session_id is not null then 1 else 0 end) as px_ash_samples,
+    count(distinct case when qc_session_id is not null
+                        then to_char(qc_instance_id)||':'||to_char(qc_session_id) end) as distinct_qc,
+    count(distinct case when session_type = 'BACKGROUND' and qc_session_id is not null
+                        then to_char(instance_number)||':'||to_char(session_id) end) as distinct_px_sessions
+from (
+    select instance_number, session_id, session_type, qc_instance_id, qc_session_id
+    from   dba_hist_active_sess_history
+    where  upper(trim('&&p_mode')) = 'HIST'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    union all
+    select inst_id as instance_number, session_id, session_type, qc_instance_id, qc_session_id
+    from   gv$active_session_history
+    where  upper(trim('&&p_mode')) = 'CURR'
+    and    sql_id = trim('&&p_sql_id')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+);
+
+prompt
+prompt =========================================================================
+prompt SECTION 12 - TOP OBJECTS
+prompt =========================================================================
+
+select *
+from (
+    select
+        nvl(owner||'.'||object_name,'<unknown>') as obj,
+        nvl(owner||'.'||object_name||' ['||object_type||']','<unknown>') as objt,
+        count(*) * 10 as total_seconds,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from (
+        select a.sample_time, o.owner, o.object_name, o.object_type
+        from   dba_hist_active_sess_history a
+        left join dba_objects o
+               on o.object_id = a.current_obj#
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    a.sql_id = trim('&&p_sql_id')
+        and    a.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        and    a.current_obj# is not null
+        and    a.current_obj# <> -1
+        union all
+        select a.sample_time, o.owner, o.object_name, o.object_type
+        from   gv$active_session_history a
+        left join dba_objects o
+               on o.object_id = a.current_obj#
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    a.sql_id = trim('&&p_sql_id')
+        and    a.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        and    a.current_obj# is not null
+        and    a.current_obj# <> -1
+    )
+    group  by owner||'.'||object_name, owner||'.'||object_name||' ['||object_type||']'
+    order  by total_seconds desc, obj
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 13 - PLAN LINE ACTIVITY (HIST)
+prompt =========================================================================
+
+select *
+from (
+    with sq as (
+        select
+            count(*) as samples,
+            ash.sql_id,
+            ash.sql_plan_hash_value,
+            nvl(ash.sql_plan_line_id,1) as sql_plan_line_id,
+            ash.session_state,
+            nvl(ash.event,'ON CPU') as event
+        from   dba_hist_active_sess_history ash
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    ash.sql_id = trim('&&p_sql_id')
+        and    ash.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                  and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        group  by ash.sql_id,
+                  ash.sql_plan_hash_value,
+                  nvl(ash.sql_plan_line_id,1),
+                  ash.session_state,
+                  nvl(ash.event,'ON CPU')
+    )
+    select
+        plan.plan_hash_value,
+        sq.samples * 10 as total_seconds,
+        lpad(to_char(round(ratio_to_report(sq.samples) over
+            (partition by sq.sql_id, sq.sql_plan_hash_value) * 100, 1), '999.9')||' %',8) as pct_child,
+        '|'||rpad(nvl(lpad('#', round(ratio_to_report(sq.samples) over
+            (partition by sq.sql_id, sq.sql_plan_hash_value) * 10), '#'), ' '), 10, ' ')||'|' as pct_child_vis,
+        plan.id as line_id,
+        plan.parent_id,
+        lpad(' ', plan.depth, ' ') || plan.operation || ' ' || plan.options ||
+            nvl2(plan.object_name, ' ['||plan.object_name||']', null) as plan_line,
+        sq.session_state,
+        sq.event
+    from   dba_hist_sql_plan plan
+    join   sq
+           on sq.sql_id = plan.sql_id
+          and sq.sql_plan_line_id = plan.id
+          and sq.sql_plan_hash_value = plan.plan_hash_value
+    where  plan.sql_id = trim('&&p_sql_id')
+    order  by total_seconds desc, plan.plan_hash_value, plan.id
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 13B - PLAN LINE ACTIVITY (CURR)
+prompt =========================================================================
+
+select *
+from (
+    with sq as (
+        select
+            count(*) as samples,
+            ash.sql_id,
+            ash.sql_plan_hash_value,
+            nvl(ash.sql_plan_line_id,1) as sql_plan_line_id,
+            ash.session_state,
+            nvl(ash.event,'ON CPU') as event
+        from   gv$active_session_history ash
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    ash.sql_id = trim('&&p_sql_id')
+        and    ash.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                  and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        group  by ash.sql_id,
+                  ash.sql_plan_hash_value,
+                  nvl(ash.sql_plan_line_id,1),
+                  ash.session_state,
+                  nvl(ash.event,'ON CPU')
+    )
+    select
+        plan.plan_hash_value,
+        sq.samples * 10 as total_seconds,
+        lpad(to_char(round(ratio_to_report(sq.samples) over
+            (partition by sq.sql_id, sq.sql_plan_hash_value) * 100, 1), '999.9')||' %',8) as pct_child,
+        '|'||rpad(nvl(lpad('#', round(ratio_to_report(sq.samples) over
+            (partition by sq.sql_id, sq.sql_plan_hash_value) * 10), '#'), ' '), 10, ' ')||'|' as pct_child_vis,
+        plan.id as line_id,
+        plan.parent_id,
+        lpad(' ', plan.depth, ' ') || plan.operation || ' ' || plan.options ||
+            nvl2(plan.object_name, ' ['||plan.object_name||']', null) as plan_line,
+        sq.session_state,
+        sq.event
+    from   gv$sql_plan plan
+    join   sq
+           on sq.sql_id = plan.sql_id
+          and sq.sql_plan_line_id = plan.id
+          and sq.sql_plan_hash_value = plan.plan_hash_value
+          and plan.inst_id = 1
+    where  plan.sql_id = trim('&&p_sql_id')
+    order  by total_seconds desc, plan.plan_hash_value, plan.id
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 14 - EVENT DRILLDOWN OVERVIEW
+prompt =========================================================================
+
+select *
+from (
+    select
+        nvl(event,'ON CPU') as event,
+        count(*) * 10 as total_seconds,
+        round(count(*) * 10 /
+              ((to_date(replace('&&p_to_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') -
+                to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')) * 86400), 1) as aas,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen,
+        count(distinct instance_number) as inst_count,
+        count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+                     to_char(sql_exec_start,'YYYYMMDDHH24MISS')||':'||to_char(sql_exec_id)) as sampled_execs
+    from (
+        select instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id, sample_time, event
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    trim('&&p_wait_event') <> '-'
+        and    sql_id = trim('&&p_sql_id')
+        and    nvl(event,'ON CPU') = trim('&&p_wait_event')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select inst_id as instance_number, session_id, session_serial#, sql_exec_start, sql_exec_id, sample_time, event
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    trim('&&p_wait_event') <> '-'
+        and    sql_id = trim('&&p_sql_id')
+        and    nvl(event,'ON CPU') = trim('&&p_wait_event')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    group by nvl(event,'ON CPU')
+)
+where trim('&&p_wait_event') <> '-';
+
+prompt
+prompt =========================================================================
+prompt SECTION 15 - EVENT DRILLDOWN BY OBJECT
+prompt =========================================================================
+
+select *
+from (
+    select
+        nvl(owner||'.'||object_name,'<unknown>') as obj,
+        nvl(owner||'.'||object_name||' ['||object_type||']','<unknown>') as objt,
+        count(*) * 10 as total_seconds,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total,
+        to_char(min(sample_time), 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time), 'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from (
+        select a.sample_time, o.owner, o.object_name, o.object_type
+        from   dba_hist_active_sess_history a
+        left join dba_objects o
+               on o.object_id = a.current_obj#
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    trim('&&p_wait_event') <> '-'
+        and    a.sql_id = trim('&&p_sql_id')
+        and    nvl(a.event,'ON CPU') = trim('&&p_wait_event')
+        and    a.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        and    a.current_obj# is not null
+        and    a.current_obj# <> -1
+        union all
+        select a.sample_time, o.owner, o.object_name, o.object_type
+        from   gv$active_session_history a
+        left join dba_objects o
+               on o.object_id = a.current_obj#
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    trim('&&p_wait_event') <> '-'
+        and    a.sql_id = trim('&&p_sql_id')
+        and    nvl(a.event,'ON CPU') = trim('&&p_wait_event')
+        and    a.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                 and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        and    a.current_obj# is not null
+        and    a.current_obj# <> -1
+    )
+    group  by owner||'.'||object_name, owner||'.'||object_name||' ['||object_type||']'
+    order  by total_seconds desc, obj
+)
+where trim('&&p_wait_event') <> '-'
+and rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 16 - EVENT DRILLDOWN BY PLAN LINE (HIST)
+prompt =========================================================================
+
+select *
+from (
+    with sq as (
+        select
+            count(*) as samples,
+            ash.sql_id,
+            ash.sql_plan_hash_value,
+            nvl(ash.sql_plan_line_id,1) as sql_plan_line_id
+        from   dba_hist_active_sess_history ash
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    trim('&&p_wait_event') <> '-'
+        and    ash.sql_id = trim('&&p_sql_id')
+        and    nvl(ash.event,'ON CPU') = trim('&&p_wait_event')
+        and    ash.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                  and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        group by ash.sql_id, ash.sql_plan_hash_value, nvl(ash.sql_plan_line_id,1)
+    )
+    select
+        plan.plan_hash_value,
+        sq.samples * 10 as total_seconds,
+        plan.id as line_id,
+        plan.parent_id,
+        lpad(' ', plan.depth, ' ') || plan.operation || ' ' || plan.options ||
+        nvl2(plan.object_name, ' ['||plan.object_name||']', null) as plan_line
+    from   dba_hist_sql_plan plan
+    join   sq
+           on sq.sql_id = plan.sql_id
+          and sq.sql_plan_hash_value = plan.plan_hash_value
+          and sq.sql_plan_line_id = plan.id
+    where  plan.sql_id = trim('&&p_sql_id')
+    order  by total_seconds desc, plan.plan_hash_value, plan.id
+)
+where trim('&&p_wait_event') <> '-'
+and rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 16B - EVENT DRILLDOWN BY PLAN LINE (CURR)
+prompt =========================================================================
+
+select *
+from (
+    with sq as (
+        select
+            count(*) as samples,
+            ash.sql_id,
+            ash.sql_plan_hash_value,
+            nvl(ash.sql_plan_line_id,1) as sql_plan_line_id
+        from   gv$active_session_history ash
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    trim('&&p_wait_event') <> '-'
+        and    ash.sql_id = trim('&&p_sql_id')
+        and    nvl(ash.event,'ON CPU') = trim('&&p_wait_event')
+        and    ash.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                                  and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        group by ash.sql_id, ash.sql_plan_hash_value, nvl(ash.sql_plan_line_id,1)
+    )
+    select
+        plan.plan_hash_value,
+        sq.samples * 10 as total_seconds,
+        plan.id as line_id,
+        plan.parent_id,
+        lpad(' ', plan.depth, ' ') || plan.operation || ' ' || plan.options ||
+        nvl2(plan.object_name, ' ['||plan.object_name||']', null) as plan_line
+    from   gv$sql_plan plan
+    join   sq
+           on sq.sql_id = plan.sql_id
+          and sq.sql_plan_hash_value = plan.plan_hash_value
+          and sq.sql_plan_line_id = plan.id
+          and plan.inst_id = 1
+    where  plan.sql_id = trim('&&p_sql_id')
+    order  by total_seconds desc, plan.plan_hash_value, plan.id
+)
+where trim('&&p_wait_event') <> '-'
+and rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 17 - EVENT DRILLDOWN BY MODULE / MACHINE / INSTANCE
+prompt =========================================================================
+
+select *
+from (
+    select
+        instance_number as inst_id,
+        nvl(module,'<null>') as module,
+        nvl(machine,'<null>') as machine,
+        count(*) * 10 as total_seconds,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_total
+    from (
+        select instance_number, module, machine
+        from   dba_hist_active_sess_history
+        where  upper(trim('&&p_mode')) = 'HIST'
+        and    trim('&&p_wait_event') <> '-'
+        and    sql_id = trim('&&p_sql_id')
+        and    nvl(event,'ON CPU') = trim('&&p_wait_event')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+        union all
+        select inst_id as instance_number, module, machine
+        from   gv$active_session_history
+        where  upper(trim('&&p_mode')) = 'CURR'
+        and    trim('&&p_wait_event') <> '-'
+        and    sql_id = trim('&&p_sql_id')
+        and    nvl(event,'ON CPU') = trim('&&p_wait_event')
+        and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    )
+    group  by instance_number, module, machine
+    order  by total_seconds desc, inst_id, module, machine
+)
+where trim('&&p_wait_event') <> '-'
+and rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 18 - EVENT DRILLDOWN BY MINUTE
+prompt =========================================================================
+
+select
+    to_char(trunc(sample_time,'MI'),'YYYY-MM-DD HH24:MI') as sample_minute,
+    instance_number as inst_id,
+    count(*) * 10 as total_seconds,
+    round(count(*) / 6, 2) as aas
+from (
+    select sample_time, instance_number
+    from   dba_hist_active_sess_history
+    where  upper(trim('&&p_mode')) = 'HIST'
+    and    trim('&&p_wait_event') <> '-'
+    and    sql_id = trim('&&p_sql_id')
+    and    nvl(event,'ON CPU') = trim('&&p_wait_event')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    union all
+    select sample_time, inst_id as instance_number
+    from   gv$active_session_history
+    where  upper(trim('&&p_mode')) = 'CURR'
+    and    trim('&&p_wait_event') <> '-'
+    and    sql_id = trim('&&p_sql_id')
+    and    nvl(event,'ON CPU') = trim('&&p_wait_event')
+    and    sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+)
+where trim('&&p_wait_event') <> '-'
+group by trunc(sample_time,'MI'), instance_number
+order by sample_minute, inst_id;
+
+prompt
+prompt =========================================================================
+prompt SECTION 19 - EVENT-SPECIFIC POINTERS
+prompt =========================================================================
+
+select
+    trim('&&p_wait_event') as event,
+    case
+        when trim('&&p_wait_event') = '-' then 'No event drilldown requested.'
+        when lower(trim('&&p_wait_event')) = 'db file sequential read' then
+            'Single-block reads. Usually index-driven access, random I/O, hot index/table probes, or nested-loop amplification. Check top objects and event plan lines.'
+        when lower(trim('&&p_wait_event')) = 'db file scattered read' then
+            'Multiblock reads. Usually full scans or index fast full scans. Check pruning, scan size, and whether the chosen plan line is doing too much scanning.'
+        when lower(trim('&&p_wait_event')) in ('direct path read temp','direct path write temp') then
+            'Temp spill. Usually sort/hash spill or workarea pressure. Check join cardinality, hash/sort plan lines, and whether PX amplified temp usage.'
+        when lower(trim('&&p_wait_event')) in ('gc buffer busy acquire','gc current block busy','gc cr block busy') then
+            'RAC hot block or cross-instance block contention. Check instance skew, hot objects, service placement, and event concentration on specific plan lines.'
+        when lower(trim('&&p_wait_event')) = 'read by other session' then
+            'Many sessions waiting for blocks another session is already reading. Check duplicated probes/scans, hot objects, and whether one access path is driving the pile-up.'
+        when lower(trim('&&p_wait_event')) = 'enq: tx - row lock contention' then
+            'Row lock contention. Check blocker signatures, app commit behavior, hot rows, and whether a small set of objects dominates the event.'
+        when lower(trim('&&p_wait_event')) = 'resmgr:cpu quantum' then
+            'CPU throttling or heavy CPU pressure. Check concurrency, Resource Manager policy, and whether the SQL is being rationed rather than intrinsically slow.'
+        when lower(trim('&&p_wait_event')) in ('cursor: pin s wait on x','library cache lock','library cache: mutex x') then
+            'Cursor/library cache contention. Check parse churn, child cursor growth, bind mismatch, and application cursor reuse.'
+        when lower(trim('&&p_wait_event')) like 'enq:%' then
+            'Enqueue wait. Check blocker signatures, object concentration, and the specific enqueue family / mode.'
+        else
+            'Use the event-object, event-plan-line, event-minute, and event-module sections together. The key question is whether the event is concentrated on one object, one plan step, one instance, or one app entry point.'
+    end as pointer_text
+from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 20 - USAGE
+prompt =========================================================================
+prompt Overall analysis:
+prompt   @px_postmortem_one.sql <sql_id> <from_ts> <to_ts> - <HIST|CURR>
+prompt
+prompt Event drilldown:
+prompt   @px_postmortem_one.sql <sql_id> <from_ts> <to_ts> "<wait_event>" <HIST|CURR>
+prompt
+prompt Examples:
+prompt   @px_postmortem_one.sql 8f3m2k1n9p0qr 2026-03-21_05:00 2026-03-21_09:30 - HIST
+prompt   @px_postmortem_one.sql 8f3m2k1n9p0qr 2026-03-21_05:00 2026-03-21_09:30 "db file sequential read" HIST
+prompt   @px_postmortem_one.sql 8f3m2k1n9p0qr 2026-03-25_13:00 2026-03-25_13:20 - CURR
+prompt =========================================================================
+
+undefine p_sql_id
+undefine p_from_ts_raw
+undefine p_to_ts_raw
+undefine p_wait_event
+undefine p_mode
+undefine p_top_n
+
+
+
+
+
+****
 -- ============================================================================
 -- File: ash_event_lookup_templates.sql
 -- Purpose:
