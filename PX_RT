@@ -1,3 +1,17 @@
+
+From the attached screenshots:
+	•	CPU capacity at cluster level is 96 (48 per node)
+	•	Peak active sessions were around 200, which is about 2x the available CPU (ratio 2.08)
+	•	Parallel workers peaked around 102, which is roughly equal to total CPU capacity (ratio 1.06)
+
+This indicates that CPU demand exceeded capacity due to concurrent workload along with parallel activity.
+
+The database throttled sessions (resmgr:cpu quantum) because CPU was fully saturated.
+
+This is a CPU contention issue, not related to storage or I/O.
+
+We will be increasing CPU capacity on this database to better handle these spikes going forward.
+
 Example 1: last several hours, auto-pick QC
 
 @px_realtime_one.sql <sql_id> LIVE_WINDOW 2026-03-23_00:00 2026-03-23_03:00 AUTO AUTO
