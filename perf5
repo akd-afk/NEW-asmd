@@ -1,0 +1,320 @@
+-- =============================================================================
+-- File: sql_exec_compare_v1.sql
+-- Purpose: Compare a bad sampled execution to a normal sampled execution.
+-- Usage:
+-- @sql_exec_compare_v1.sql <sql_id> <bad_inst> <bad_sid> <bad_serial> <bad_exec_start_ts> <bad_sql_exec_id> <good_inst> <good_sid> <good_serial> <good_exec_start_ts> <good_sql_exec_id>
+-- =============================================================================
+define p_sql_id='&&1'
+define p_bad_inst='&&2'
+define p_bad_sid='&&3'
+define p_bad_serial='&&4'
+define p_bad_exec_start='&&5'
+define p_bad_sql_exec_id='&&6'
+define p_good_inst='&&7'
+define p_good_sid='&&8'
+define p_good_serial='&&9'
+define p_good_exec_start='&&10'
+define p_good_sql_exec_id='&&11'
+set pages 500 lines 380 trimspool on verify off feedback on echo off tab off
+col sql_text format a140 word_wrapped
+col exec_start format a19
+col event format a45 word_wrapped
+col wait_class format a18
+col phase_bucket format a12
+col sql_plan_op format a45 trunc
+col plan_line format a110
+col owner format a20
+col object_name format a35
+col subobject_name format a30
+col object_type format a18
+col clue_header format a48
+col diagnosis_hint format a28
+col notes format a118 word_wrapped
+col likely_causes format a118 word_wrapped
+col next_step format a128 word_wrapped
+col where_to_check format a128 word_wrapped
+
+prompt =========================================================================
+prompt SQL EXEC COMPARE V1
+prompt =========================================================================
+
+prompt SECTION 1 - IDENTITY / SQL TEXT
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_base as (
+  select e.execution_role,a.* from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+)
+select execution_role,instance_number,session_id,session_serial#,sql_exec_id,to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') exec_start,
+       max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,
+       to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') begin_time,to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') end_time,
+       count(*) sample_cnt,count(*)*10 sampled_secs,
+       round((cast(max(sample_time) as date)-cast(min(sample_time) as date))*86400,1) approx_elapsed_s
+from ash_base
+group by execution_role,instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+order by execution_role;
+select sql_id, sql_text from dba_hist_sqltext where sql_id=trim('&&p_sql_id');
+
+prompt SECTION 2 - START HERE / CHANGE SUMMARY
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_base as (
+  select e.execution_role,a.* from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+),
+agg as (
+  select execution_role,max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,count(*)*10 sampled_secs,
+         sum(case when session_state='WAITING' then 1 else 0 end)*10 wait_secs,
+         sum(case when session_state='ON CPU' then 1 else 0 end)*10 cpu_secs,
+         sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+         sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+  from ash_base group by execution_role
+),
+evt as (
+  select execution_role,nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 secs,
+         row_number() over(partition by execution_role order by count(*) desc,nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')) rn
+  from ash_base group by execution_role,nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+),
+b as (select * from agg where execution_role='BAD'),
+g as (select * from agg where execution_role='NORMAL'),
+be as (select * from evt where execution_role='BAD' and rn=1),
+ge as (select * from evt where execution_role='NORMAL' and rn=1)
+select 1 ord,
+       case when b.plan_hash_value<>g.plan_hash_value then 'PLAN_CHANGED' else 'PLAN_SAME' end diagnosis_hint,
+       case when b.plan_hash_value<>g.plan_hash_value then 'Plan differs between bad and normal execution' else 'Plan is the same between bad and normal execution' end clue_header,
+       'Bad plan='||nvl(to_char(b.plan_hash_value),'<null>')||', normal plan='||nvl(to_char(g.plan_hash_value),'<null>') notes,
+       case when b.plan_hash_value<>g.plan_hash_value then 'Plan regression; bind-sensitive plan; stats-driven instability.' else 'Plan change is not the primary differentiator.' end likely_causes,
+       case when b.plan_hash_value<>g.plan_hash_value then 'Check SECTION 5 and SECTION 6 first.' else 'Check wait and phase differences first.' end next_step,
+       case when b.plan_hash_value<>g.plan_hash_value then 'Check plan operations and plan lines unique to the bad execution.' else 'Check SECTION 3 and SECTION 4.' end where_to_check
+from b cross join g
+union all
+select 2,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'BLOCKING_DIFFERENCE'
+            when b.px_secs>g.px_secs then 'PX_DIFFERENCE'
+            when b.wait_secs>g.wait_secs then 'WAIT_PROFILE_DIFFERENCE'
+            when b.cpu_secs>g.cpu_secs then 'CPU_PROFILE_DIFFERENCE'
+            else 'MIXED_DIFFERENCE' end,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Bad execution is blocked while normal is not'
+            when b.px_secs>g.px_secs then 'Bad execution is more PX-heavy than normal'
+            when b.wait_secs>g.wait_secs then 'Bad execution is more wait-heavy than normal'
+            when b.cpu_secs>g.cpu_secs then 'Bad execution is more CPU-heavy than normal'
+            else 'Bad and normal differ, but no single factor dominates' end,
+       'Bad sampled_secs='||b.sampled_secs||', normal sampled_secs='||g.sampled_secs||', bad top event='||be.event||', normal top event='||ge.event,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Victim execution; blocker-specific degradation.'
+            when b.px_secs>g.px_secs then 'PX skew / RAC amplification / distributed overhead.'
+            when b.wait_secs>g.wait_secs then 'External bottleneck / event-specific difference.'
+            when b.cpu_secs>g.cpu_secs then 'Plan efficiency / row-source work / cardinality issue.'
+            else 'Needs line/object diff review.' end,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Check SECTION 8 immediately.'
+            when b.px_secs>g.px_secs then 'Check SECTION 7 and SECTION 6.'
+            when b.wait_secs>g.wait_secs then 'Check SECTION 3 and SECTION 4.'
+            when b.cpu_secs>g.cpu_secs then 'Check SECTION 5 and SECTION 6.'
+            else 'Check all diff sections.' end,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Check blocker details and event chronology.'
+            when b.px_secs>g.px_secs then 'Check PX detail, plan line hotspots, and instance placement.'
+            when b.wait_secs>g.wait_secs then 'Check top event diff and phase buckets.'
+            when b.cpu_secs>g.cpu_secs then 'Check plan-line and object hotspots.'
+            else 'Check sections 3 through 8.' end
+from b cross join g cross join be cross join ge
+order by ord;
+
+prompt SECTION 3 - TOP EVENT DIFF
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_base as (
+  select e.execution_role,a.* from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+),
+agg as (
+  select execution_role,nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 sampled_secs
+  from ash_base group by execution_role,nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+),
+b as (select wait_class,event,sampled_secs from agg where execution_role='BAD'),
+g as (select wait_class,event,sampled_secs from agg where execution_role='NORMAL')
+select * from (
+  select nvl(b.wait_class,g.wait_class) wait_class,nvl(b.event,g.event) event,nvl(b.sampled_secs,0) bad_secs,nvl(g.sampled_secs,0) normal_secs,nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0) delta_secs
+  from b full outer join g on b.wait_class=g.wait_class and b.event=g.event
+  order by abs(nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0)) desc, event
+) where rownum <= 20;
+
+prompt SECTION 4 - PHASE DIFF
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_base as (
+  select e.execution_role,round((cast(a.sample_time as date)-cast(a.sql_exec_start as date))*86400) secs_from_exec_start
+  from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+),
+agg as (
+  select execution_role,case when secs_from_exec_start<5 then '00-04s' when secs_from_exec_start<10 then '05-09s' when secs_from_exec_start<20 then '10-19s' when secs_from_exec_start<30 then '20-29s' when secs_from_exec_start<45 then '30-44s' when secs_from_exec_start<60 then '45-59s' else '60s+' end phase_bucket,count(*)*10 sampled_secs
+  from ash_base
+  group by execution_role,case when secs_from_exec_start<5 then '00-04s' when secs_from_exec_start<10 then '05-09s' when secs_from_exec_start<20 then '10-19s' when secs_from_exec_start<30 then '20-29s' when secs_from_exec_start<45 then '30-44s' when secs_from_exec_start<60 then '45-59s' else '60s+' end
+),
+b as (select phase_bucket,sampled_secs from agg where execution_role='BAD'),
+g as (select phase_bucket,sampled_secs from agg where execution_role='NORMAL')
+select nvl(b.phase_bucket,g.phase_bucket) phase_bucket,nvl(b.sampled_secs,0) bad_secs,nvl(g.sampled_secs,0) normal_secs,nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0) delta_secs
+from b full outer join g on b.phase_bucket=g.phase_bucket
+order by phase_bucket;
+
+prompt SECTION 5 - PLAN OPERATION DIFF
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_base as (
+  select e.execution_role,nvl(a.sql_plan_hash_value,0) plan_hash_value,nvl(a.sql_plan_operation||' '||a.sql_plan_options,'<null>') sql_plan_op
+  from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+),
+agg as (
+  select execution_role,plan_hash_value,sql_plan_op,count(*)*10 sampled_secs
+  from ash_base group by execution_role,plan_hash_value,sql_plan_op
+),
+b as (select plan_hash_value,sql_plan_op,sampled_secs from agg where execution_role='BAD'),
+g as (select plan_hash_value,sql_plan_op,sampled_secs from agg where execution_role='NORMAL')
+select * from (
+  select nvl(b.plan_hash_value,g.plan_hash_value) plan_hash_value,nvl(b.sql_plan_op,g.sql_plan_op) sql_plan_op,
+         nvl(b.sampled_secs,0) bad_secs,nvl(g.sampled_secs,0) normal_secs,nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0) delta_secs
+  from b full outer join g on b.plan_hash_value=g.plan_hash_value and b.sql_plan_op=g.sql_plan_op
+  order by abs(nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0)) desc, sql_plan_op
+) where rownum <= 20;
+
+prompt SECTION 6 - PLAN LINE DIFF
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_lines as (
+  select e.execution_role,a.sql_id,a.sql_plan_hash_value,nvl(a.sql_plan_line_id,1) sql_plan_line_id,count(*) samples
+  from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+  group by e.execution_role,a.sql_id,a.sql_plan_hash_value,nvl(a.sql_plan_line_id,1)
+),
+joined as (
+  select execution_role,l.plan_hash_value,l.id line_id,lpad(' ',l.depth,' ')||l.operation||' '||l.options||nvl2(l.object_name,' ['||l.object_name||']',null) plan_line,al.samples*10 sampled_secs
+  from dba_hist_sql_plan l join ash_lines al
+    on al.sql_id=l.sql_id and al.sql_plan_hash_value=l.plan_hash_value and al.sql_plan_line_id=l.id
+  where l.sql_id=trim('&&p_sql_id')
+),
+b as (select plan_hash_value,line_id,plan_line,sampled_secs from joined where execution_role='BAD'),
+g as (select plan_hash_value,line_id,plan_line,sampled_secs from joined where execution_role='NORMAL')
+select * from (
+  select nvl(b.plan_hash_value,g.plan_hash_value) plan_hash_value,nvl(b.line_id,g.line_id) line_id,nvl(b.plan_line,g.plan_line) plan_line,
+         nvl(b.sampled_secs,0) bad_secs,nvl(g.sampled_secs,0) normal_secs,nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0) delta_secs
+  from b full outer join g on b.plan_hash_value=g.plan_hash_value and b.line_id=g.line_id
+  order by abs(nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0)) desc, line_id
+) where rownum <= 20;
+
+prompt SECTION 7 - OBJECT DIFF
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_objs as (
+  select e.execution_role,nvl(o.owner,'<unknown>') owner,nvl(o.object_name,'<unknown>') object_name,nvl(o.subobject_name,'<none>') subobject_name,nvl(o.object_type,'<unknown>') object_type,count(*)*10 sampled_secs
+  from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+    left join dba_objects o on o.object_id=a.current_obj#
+  where a.current_obj# is not null and a.current_obj#<>-1
+  group by e.execution_role,nvl(o.owner,'<unknown>'),nvl(o.object_name,'<unknown>'),nvl(o.subobject_name,'<none>'),nvl(o.object_type,'<unknown>')
+),
+b as (select owner,object_name,subobject_name,object_type,sampled_secs from ash_objs where execution_role='BAD'),
+g as (select owner,object_name,subobject_name,object_type,sampled_secs from ash_objs where execution_role='NORMAL')
+select * from (
+  select nvl(b.owner,g.owner) owner,nvl(b.object_name,g.object_name) object_name,nvl(b.subobject_name,g.subobject_name) subobject_name,nvl(b.object_type,g.object_type) object_type,
+         nvl(b.sampled_secs,0) bad_secs,nvl(g.sampled_secs,0) normal_secs,nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0) delta_secs
+  from b full outer join g on b.owner=g.owner and b.object_name=g.object_name and b.subobject_name=g.subobject_name and b.object_type=g.object_type
+  order by abs(nvl(b.sampled_secs,0)-nvl(g.sampled_secs,0)) desc, owner, object_name
+) where rownum <= 20;
+
+prompt SECTION 8 - BLOCKING / PX DIFF
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+agg as (
+  select e.execution_role,
+         sum(case when a.blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+         sum(case when a.qc_session_id is not null then 1 else 0 end)*10 px_sampled_secs,
+         count(distinct case when a.qc_session_id is not null then to_char(a.qc_instance_id)||':'||to_char(a.qc_session_id) end) px_coord_count,
+         count(distinct case when a.session_type='BACKGROUND' and a.qc_session_id is not null then to_char(a.instance_number)||':'||to_char(a.session_id) end) distinct_px_servers
+  from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+  group by e.execution_role
+)
+select * from agg order by execution_role;
+
+prompt SECTION 9 - BARE BONES SUMMARY / LIKELY ROOT
+with exec_ids as (
+  select 'BAD' execution_role,to_number('&&p_bad_inst') instance_number,to_number('&&p_bad_sid') session_id,to_number('&&p_bad_serial') session_serial#,to_date(replace('&&p_bad_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS') sql_exec_start,to_number('&&p_bad_sql_exec_id') sql_exec_id from dual
+  union all
+  select 'NORMAL',to_number('&&p_good_inst'),to_number('&&p_good_sid'),to_number('&&p_good_serial'),to_date(replace('&&p_good_exec_start','_',' '),'YYYY-MM-DD HH24:MI:SS'),to_number('&&p_good_sql_exec_id') from dual
+),
+ash_base as (
+  select e.execution_role,a.* from exec_ids e join dba_hist_active_sess_history a
+    on a.sql_id=trim('&&p_sql_id') and a.instance_number=e.instance_number and a.session_id=e.session_id and a.session_serial#=e.session_serial# and a.sql_exec_start=e.sql_exec_start and a.sql_exec_id=e.sql_exec_id
+),
+agg as (
+  select execution_role,max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,count(*)*10 sampled_secs,
+         sum(case when session_state='WAITING' then 1 else 0 end)*10 wait_secs,
+         sum(case when session_state='ON CPU' then 1 else 0 end)*10 cpu_secs,
+         sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+         sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+  from ash_base group by execution_role
+),
+b as (select * from agg where execution_role='BAD'),
+g as (select * from agg where execution_role='NORMAL')
+select 1 ord,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'SMOKING_GUN = BLOCKING DIFFERENCE'
+            when b.plan_hash_value<>g.plan_hash_value then 'SMOKING_GUN = PLAN REGRESSION'
+            when b.px_secs>g.px_secs then 'SMOKING_GUN = PX / RAC AMPLIFICATION'
+            when b.wait_secs>g.wait_secs then 'SMOKING_GUN = WAIT PROFILE CHANGE'
+            when b.cpu_secs>g.cpu_secs then 'SMOKING_GUN = CPU / ROW-SOURCE DIFFERENCE'
+            else 'SMOKING_GUN = MIXED DIFFERENCE' end clue_header,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'The bad execution is blocked while the normal one is not.'
+            when b.plan_hash_value<>g.plan_hash_value then 'The bad execution uses a different plan than the normal one.'
+            when b.px_secs>g.px_secs then 'The bad execution is more PX-heavy than the normal one.'
+            when b.wait_secs>g.wait_secs then 'The bad execution is more wait-heavy than the normal one.'
+            when b.cpu_secs>g.cpu_secs then 'The bad execution is more CPU-heavy than the normal one.'
+            else 'The bad execution differs from the normal one, but no single factor alone explains it.' end notes,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Victim execution; blocker-specific degradation.'
+            when b.plan_hash_value<>g.plan_hash_value then 'Plan regression; bind-sensitive plan; stats-driven instability.'
+            when b.px_secs>g.px_secs then 'PX skew; QC overhead; RAC amplification.'
+            when b.wait_secs>g.wait_secs then 'Wait-specific external bottleneck.'
+            when b.cpu_secs>g.cpu_secs then 'Row-source inefficiency; row explosion; join method issue.'
+            else 'Mixed behavior.' end likely_causes,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Review SECTION 8 first.'
+            when b.plan_hash_value<>g.plan_hash_value then 'Review SECTION 5 and SECTION 6 first.'
+            when b.px_secs>g.px_secs then 'Review SECTION 8 and SECTION 6 first.'
+            when b.wait_secs>g.wait_secs then 'Review SECTION 3 and SECTION 4 first.'
+            when b.cpu_secs>g.cpu_secs then 'Review SECTION 5, SECTION 6, and SECTION 7 first.'
+            else 'Review all diff sections.' end next_step,
+       case when b.blocked_secs>0 and g.blocked_secs=0 then 'Check blocker details and app transaction overlap.'
+            when b.plan_hash_value<>g.plan_hash_value then 'Check plan op diff, plan line diff, and object diff.'
+            when b.px_secs>g.px_secs then 'Check PX details, plan line hotspot, and instance placement.'
+            when b.wait_secs>g.wait_secs then 'Check event diff and phase diff.'
+            when b.cpu_secs>g.cpu_secs then 'Check plan lines and top objects.'
+            else 'Check sections 3 through 8.' end where_to_check
+from b cross join g;
+
+prompt =========================================================================
+prompt USAGE
+prompt =========================================================================
+prompt   @sql_exec_compare_v1.sql <sql_id> <bad_inst> <bad_sid> <bad_serial> <bad_exec_start_ts> <bad_sql_exec_id> <good_inst> <good_sid> <good_serial> <good_exec_start_ts> <good_sql_exec_id>
+prompt =========================================================================
