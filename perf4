@@ -1,0 +1,795 @@
+-- =============================================================================
+-- File: sql_wait_forensics_xray.sql
+-- Purpose:
+--   Event-centric "smoking gun" drilldown for one SQL_ID and one chosen wait event.
+--
+-- Design goal:
+--   Fast interpretation during mission-critical incidents. This script is built to
+--   answer, in order:
+--     1. Does this wait really matter for this SQL in this window?
+--     2. Which execution(s) own the wait?
+--     3. Which plan / plan line / object own the wait?
+--     4. Is the issue more likely blocking, PX/RAC amplification, access path,
+--        concurrency, or broad systemic pressure?
+--
+-- Usage:
+--   @sql_wait_forensics_xray.sql <sql_id> <from_ts> <to_ts> "<event_text>"
+--
+-- Example:
+--   @sql_wait_forensics_xray.sql 1abcxyz123456 2026-03-21_05:00 2026-03-21_09:30 "gc buffer busy acquire"
+--
+-- Timestamp format:
+--   YYYY-MM-DD_HH24:MI
+--
+-- Notes:
+--   - Keep the event text exactly as Oracle records it.
+--   - Quote the event if it contains spaces.
+--   - Requires Diagnostics Pack licensing compliance for DBA_HIST_* usage.
+--   - Historical ASH is sampled data, not exact wall-clock truth.
+--   - Very short executions may not be sampled at all.
+-- =============================================================================
+
+define p_sql_id      = '&&1'
+define p_from_ts_raw = '&&2'
+define p_to_ts_raw   = '&&3'
+define p_event_text  = '&&4'
+define p_top_n       = '15'
+
+set pages 500
+set lines 380
+set trimspool on
+set verify off
+set feedback on
+set echo off
+set tab off
+set long 100000
+set longchunksize 100000
+
+col sql_id                  format a15
+col sql_text                format a145 word_wrapped
+col begin_time              format a19
+col end_time                format a19
+col first_seen              format a19
+col last_seen               format a19
+col exec_start              format a19
+col sample_time             format a19
+col event                   format a52 word_wrapped
+col wait_class              format a18
+col session_state           format a10
+col module                  format a28 trunc
+col action                  format a28 trunc
+col machine                 format a34 trunc
+col program                 format a40 trunc
+col sql_plan_op             format a48 trunc
+col plan_line               format a112
+col owner                   format a20
+col object_name             format a35
+col subobject_name          format a30
+col object_type             format a18
+col severity                format a8
+col diagnosis_hint          format a28
+col clue_header             format a46
+col notes                   format a118 word_wrapped
+col next_step               format a128 word_wrapped
+
+col likely_causes           format a118 word_wrapped
+col where_to_check          format a118 word_wrapped
+col dimension               format a22
+col winner_value            format a90 word_wrapped
+col recommended_action      format a120 word_wrapped
+col monitor_status          format a16
+col phase_bucket            format a12
+
+col instance_number         format 999999
+col session_id              format 999999
+col session_serial#         format 999999
+col sql_exec_id             format 999999999999
+col plan_hash_value         format 999999999999999
+col line_id                 format 999999
+col parent_id               format 999999
+col sample_cnt              format 999999999
+col event_samples           format 999999999
+col sampled_secs            format 999999999
+col wait_event_secs         format 999999999
+col approx_elapsed_s        format 999999999.9
+col pct_of_exec             format 990.99
+col pct_of_event            format 990.99
+col pct_of_total            format 990.99
+col px_secs                 format 999999999
+col blocked_secs            format 999999999
+col px_coord_count          format 999999999
+col distinct_px_servers     format 999999999
+col executions_seen         format 999999999
+col secs_from_exec_start    format 999999999
+col score                   format 999999
+col window_minutes          format 9999990.0
+col signal_strength         format 990.99
+col monitor_elapsed_s       format 999999999.9
+col monitor_cpu_s           format 999999999.9
+col monitor_io_s            format 999999999.9
+
+prompt =========================================================================
+prompt SQL WAIT FORENSICS XRAY
+prompt =========================================================================
+prompt SQL_ID  : &&p_sql_id
+prompt FROM_TS : &&p_from_ts_raw
+prompt TO_TS   : &&p_to_ts_raw
+prompt EVENT   : &&p_event_text
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt HOW TO READ THIS REPORT
+prompt =========================================================================
+prompt 1. Start with SECTION 2 and SECTION 3 only.
+prompt 2. SECTION 2 tells you if this wait matters and what likely explains it.
+prompt 3. SECTION 3 tells you the winning execution, plan, plan line, and object.
+prompt 4. If one execution dominates, jump to SECTION 4 and SECTION 5.
+prompt 5. If one plan line dominates, that is usually the smoking gun.
+prompt 6. If blocking is present, investigate blocking before SQL tuning.
+prompt 7. If PX and Cluster show together, suspect PX/RAC amplification.
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - WINDOW / SQL / EVENT SANITY
+prompt =========================================================================
+
+with p as (
+    select
+        trim('&&p_sql_id') as sql_id,
+        trim('&&p_event_text') as event_text,
+        to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') as from_ts,
+        to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI') as to_ts
+    from dual
+)
+select
+    sql_id,
+    event_text as event,
+    to_char(from_ts, 'YYYY-MM-DD HH24:MI:SS') as begin_time,
+    to_char(to_ts  , 'YYYY-MM-DD HH24:MI:SS') as end_time,
+    round((to_ts - from_ts) * 24 * 60, 1) as window_minutes
+from p;
+
+select sql_id, sql_text
+from   dba_hist_sqltext
+where  sql_id = trim('&&p_sql_id');
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - START HERE / SIGNAL SCORECARD
+prompt =========================================================================
+prompt This section is the plain-English answer key.
+prompt =========================================================================
+
+with ash_all as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+),
+ash_evt as (
+    select *
+    from ash_all
+    where nvl(event,'ON CPU') = trim('&&p_event_text')
+),
+evt as (
+    select
+        count(*) as event_samples,
+        count(*) * 10 as wait_event_secs,
+        round(count(*) * 100 / nullif((select count(*) from ash_all),0), 2) as pct_of_total,
+        max(wait_class) keep (dense_rank last order by sample_time) as wait_class,
+        sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+        sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs,
+        count(distinct sql_plan_hash_value) as plan_hashes,
+        count(distinct case when sql_exec_start is not null and sql_exec_id is not null
+             then to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+                  to_char(sql_exec_id)||':'||to_char(sql_exec_start,'YYYYMMDDHH24MISS') end) as executions_seen,
+        to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from ash_evt
+)
+select 1 as ord,
+       case
+         when nvl(e.event_samples,0) = 0 then 'HIGH'
+         when nvl(e.pct_of_total,0) >= 20 then 'HIGH'
+         when nvl(e.pct_of_total,0) >= 10 then 'MEDIUM'
+         else 'LOW'
+       end as severity,
+       'EVENT_MATERIALITY' as diagnosis_hint,
+       case
+         when nvl(e.event_samples,0) = 0 then 'Chosen wait not found in this window'
+         when nvl(e.pct_of_total,0) >= 20 then 'Chosen wait is a major part of this SQL'
+         when nvl(e.pct_of_total,0) >= 10 then 'Chosen wait is materially involved'
+         else 'Chosen wait is present but not dominant'
+       end as clue_header,
+       case
+         when nvl(e.event_samples,0) = 0 then 'There are no historical ASH samples for this wait event in the selected window.'
+         else 'This wait event accounts for '||to_char(e.pct_of_total)||'% of this SQL''s sampled activity in the chosen window.' end as notes,
+       case
+         when nvl(e.event_samples,0) = 0 then 'Event spelling mismatch; wrong window; execution too short to be sampled.'
+         when nvl(e.pct_of_total,0) >= 20 then 'This wait is a primary investigation target.'
+         else 'This wait is secondary unless it maps to one bad execution, one plan line, or one object.' end as likely_causes,
+       case
+         when nvl(e.event_samples,0) = 0 then 'Check event spelling, widen the window, or pick another event from triage output.'
+         else 'Continue to SECTION 3. That section identifies the execution, plan, plan line, and object most associated with this wait.' end as next_step,
+       case
+         when nvl(e.event_samples,0) = 0 then 'Check triage output for exact event text; verify SQL_ID; widen window; review AWR SQLSTAT totals.'
+         else 'Check SECTION 3 first. Then use SECTION 4, 8, and 9 to confirm execution, plan line, and object ownership.' end as where_to_check
+from evt e
+union all
+select 2,
+       case
+         when e.blocked_secs > 0 then 'HIGH'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'HIGH'
+         when e.wait_class = 'User I/O' then 'MEDIUM'
+         when e.wait_class = 'Concurrency' then 'MEDIUM'
+         else 'MEDIUM'
+       end,
+       case
+         when e.blocked_secs > 0 then 'VICTIM_OR_CONTENTION_DRIVEN'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'PX_RAC_AMPLIFIED'
+         when e.wait_class = 'User I/O' then 'ACCESS_PATH_OR_OBJECT_DRIVEN'
+         when e.wait_class = 'Concurrency' then 'CONTENTION_DRIVEN'
+         when e.wait_class = 'Application' then 'APPLICATION_SIDE_CONTENTION'
+         when e.wait_class = 'Commit' then 'COMMIT_OR_REDO_DRIVEN'
+         else 'EVENT_NEEDS_CONTEXT'
+       end,
+       case
+         when e.blocked_secs > 0 then 'Blocking is part of the wait story'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'PX plus RAC amplification is likely'
+         when e.wait_class = 'User I/O' then 'Access path or object pressure is likely'
+         when e.wait_class = 'Concurrency' then 'Concurrency pressure is likely'
+         when e.wait_class = 'Application' then 'Application side contention is likely'
+         when e.wait_class = 'Commit' then 'Commit / redo pressure is likely'
+         else 'Use plan line and object ownership to isolate the event'
+       end,
+       case
+         when e.blocked_secs > 0 then 'Blocking samples exist while this wait is active. The SQL may be the victim, not the root cause.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'This wait appears in PX and Cluster context together. That is a classic pattern for PX/RAC amplification or hot block movement.'
+         when e.wait_class = 'User I/O' then 'This wait points toward scan shape, access path, pruning misses, or one dominant object.'
+         when e.wait_class = 'Concurrency' then 'This wait points toward row locks, latches, mutexes, or buffer style contention.'
+         when e.wait_class = 'Application' then 'This wait points toward enqueues or app-side concurrency patterns.'
+         when e.wait_class = 'Commit' then 'This wait points toward commit frequency or redo/log pressure.'
+         else 'Use the winner sections below to isolate which execution, plan line, and object own this event.' end,
+       case
+         when e.blocked_secs > 0 then 'Row lock contention; enqueue pressure; hot blockers; victim session effect.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'Hot block shipping; PX skew; QC/slave imbalance; cross-instance full scan / hash activity.'
+         when e.wait_class = 'User I/O' then 'Bad access path; full scan; partition pruning miss; stale stats; one hot segment; storage latency.'
+         when e.wait_class = 'Concurrency' then 'Row locks; latch / mutex pressure; buffer busy; segment hot spots; cursor contention.'
+         when e.wait_class = 'Application' then 'App-side serialization; enqueue waits; procedural bottleneck; transaction design issue.'
+         when e.wait_class = 'Commit' then 'Frequent commits; log file sync pressure; redo I/O bottleneck; commit batching issue.'
+         else 'Need execution, plan line, and object context to isolate cause.' end,
+       case
+         when e.blocked_secs > 0 then 'Go to SECTION 10 first, then SECTION 4.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'Go to SECTION 8 and SECTION 11 first.'
+         when e.wait_class = 'User I/O' then 'Go to SECTION 8 and SECTION 9 first.'
+         when e.wait_class = 'Concurrency' then 'Go to SECTION 4 and SECTION 10 first.'
+         else 'Go to SECTION 3 first.' end,
+       case
+         when e.blocked_secs > 0 then 'Check blocker SID/serial pattern; application lock ordering; concurrent DML windows; blocking SQL if available.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'Check PX server count; QC involvement; instance skew; top plan line in SECTION 8; object in SECTION 9; RAC distribution from triage.'
+         when e.wait_class = 'User I/O' then 'Check top plan line; object ownership; table/index stats freshness; partition pruning; avg_pio_per_exec from triage; SQL Monitor if live.'
+         when e.wait_class = 'Concurrency' then 'Check blockers; hot objects; plan line concentration; child cursors / mutex pressure outside this script.'
+         when e.wait_class = 'Application' then 'Check module/action ownership; enqueue/blocking sections; app commit / transaction pattern.'
+         when e.wait_class = 'Commit' then 'Check redo/log related waits in broader DB view; app commit frequency; concurrent commit spikes.'
+         else 'Check SECTION 3, 4, 8, and 9 together.' end
+from evt e
+order by ord;
+
+prompt =========================================================================
+prompt SECTION 3 - WINNERS / SMOKING GUN SCOREBOARD
+prompt =========================================================================
+prompt This section tries to tell you what owns the chosen wait.
+prompt =========================================================================
+
+with ash_all as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+),
+ash_evt as (
+    select *
+    from ash_all
+    where nvl(event,'ON CPU') = trim('&&p_event_text')
+),
+top_exec as (
+    select *
+    from (
+        select
+            instance_number||'/'||session_id||'/'||session_serial#||' exec_id='||sql_exec_id||
+            ' start='||to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS')||
+            ' plan='||nvl(to_char(max(sql_plan_hash_value) keep (dense_rank last order by sample_time)),'<null>') as winner_value,
+            count(*) * 10 as score
+        from ash_evt
+        where sql_exec_start is not null
+        and   sql_exec_id is not null
+        group by instance_number, session_id, session_serial#, sql_exec_id, sql_exec_start
+        order by score desc, min(sample_time)
+    )
+    where rownum = 1
+),
+top_plan as (
+    select *
+    from (
+        select
+            'plan_hash_value='||nvl(to_char(sql_plan_hash_value),'<null>') as winner_value,
+            count(*) * 10 as score
+        from ash_evt
+        group by sql_plan_hash_value
+        order by score desc, sql_plan_hash_value
+    )
+    where rownum = 1
+),
+top_obj as (
+    select *
+    from (
+        select
+            nvl(o.owner,'<unknown>')||'.'||nvl(o.object_name,'<unknown>')||' ['||nvl(o.object_type,'<unknown>')||']' as winner_value,
+            count(*) * 10 as score
+        from ash_evt a
+        left join dba_objects o
+          on o.object_id = a.current_obj#
+        where a.current_obj# is not null
+        and   a.current_obj# <> -1
+        group by nvl(o.owner,'<unknown>')||'.'||nvl(o.object_name,'<unknown>')||' ['||nvl(o.object_type,'<unknown>')||']'
+        order by score desc, winner_value
+    )
+    where rownum = 1
+),
+top_line as (
+    select *
+    from (
+        with evt_line as (
+            select sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,1) as sql_plan_line_id, count(*) as event_samples
+            from ash_evt
+            group by sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,1)
+        )
+        select
+            'plan='||l.plan_hash_value||' line='||l.id||' '||
+            lpad(' ', l.depth, ' ') || l.operation || ' ' || l.options ||
+            nvl2(l.object_name, ' ['||l.object_name||']', null) as winner_value,
+            evt_line.event_samples * 10 as score
+        from dba_hist_sql_plan l
+        join evt_line
+          on evt_line.sql_id = l.sql_id
+         and evt_line.sql_plan_hash_value = l.plan_hash_value
+         and evt_line.sql_plan_line_id = l.id
+        where l.sql_id = trim('&&p_sql_id')
+        order by score desc, l.plan_hash_value, l.id
+    )
+    where rownum = 1
+),
+top_geo as (
+    select *
+    from (
+        select
+            'inst='||instance_number||' module='||nvl(module,'<null>')||' action='||nvl(action,'<null>')||' machine='||nvl(machine,'<null>') as winner_value,
+            count(*) * 10 as score
+        from ash_evt
+        group by instance_number, module, action, machine
+        order by score desc, instance_number, module, action
+    )
+    where rownum = 1
+)
+select 'OWNING_EXECUTION' as dimension,
+       winner_value,
+       score as wait_event_secs,
+       'Use sql_exec_forensics.sql on this execution if you need full second-by-second behavior.' as recommended_action
+from top_exec
+union all
+select 'OWNING_PLAN',
+       winner_value,
+       score,
+       'If this plan differs from normal executions, suspect plan instability or environment-sensitive plan choice.'
+from top_plan
+union all
+select 'OWNING_PLAN_LINE',
+       winner_value,
+       score,
+       'This is often the nearest thing to the smoking gun. Check whether the wait is concentrated on this line.'
+from top_line
+union all
+select 'OWNING_OBJECT',
+       winner_value,
+       score,
+       'If one object dominates, investigate stats, access path, pruning, and access concurrency for this object.'
+from top_obj
+union all
+select 'OWNING_GEOGRAPHY',
+       winner_value,
+       score,
+       'If one module/action/machine dominates, correlate to the application path or batch job that triggers this wait.'
+from top_geo;
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - WHICH EXECUTIONS OWN THIS WAIT EVENT
+prompt =========================================================================
+
+with evt as (
+    select
+        instance_number,
+        session_id,
+        session_serial#,
+        sql_exec_id,
+        sql_exec_start,
+        sql_plan_hash_value as plan_hash_value,
+        sample_time,
+        blocking_session,
+        qc_session_id
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   nvl(event,'ON CPU') = trim('&&p_event_text')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    and   sql_exec_start is not null
+    and   sql_exec_id is not null
+)
+select *
+from (
+    select
+        row_number() over (order by count(*) desc, min(sample_time)) as score,
+        instance_number,
+        session_id,
+        session_serial#,
+        sql_exec_id,
+        to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') as exec_start,
+        max(plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value,
+        count(*) * 10 as wait_event_secs,
+        round((cast(max(sample_time) as date) - cast(min(sample_time) as date)) * 86400, 1) as approx_elapsed_s,
+        sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+        sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs,
+        to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') as last_seen,
+        case
+            when sum(case when blocking_session is not null then 1 else 0 end) > 0 then 'EVENT_PLUS_BLOCKING'
+            when sum(case when qc_session_id is not null then 1 else 0 end) > 0 then 'EVENT_PLUS_PX'
+            else 'EVENT_CENTRIC'
+        end as diagnosis_hint
+    from evt
+    group by instance_number, session_id, session_serial#, sql_exec_id, sql_exec_start
+    order by wait_event_secs desc, min(sample_time)
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 5 - EVENT TIMELINE INSIDE EACH EXECUTION
+prompt =========================================================================
+
+with evt as (
+    select
+        instance_number,
+        session_id,
+        session_serial#,
+        sql_exec_id,
+        sql_exec_start,
+        round((cast(sample_time as date) - cast(sql_exec_start as date)) * 86400) as secs_from_exec_start
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   nvl(event,'ON CPU') = trim('&&p_event_text')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    and   sql_exec_start is not null
+    and   sql_exec_id is not null
+)
+select
+    instance_number,
+    session_id,
+    session_serial#,
+    sql_exec_id,
+    to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') as exec_start,
+    case
+        when secs_from_exec_start < 5 then '00-04s'
+        when secs_from_exec_start < 10 then '05-09s'
+        when secs_from_exec_start < 20 then '10-19s'
+        when secs_from_exec_start < 30 then '20-29s'
+        when secs_from_exec_start < 45 then '30-44s'
+        when secs_from_exec_start < 60 then '45-59s'
+        else '60s+'
+    end as phase_bucket,
+    count(*) * 10 as wait_event_secs
+from evt
+group by instance_number, session_id, session_serial#, sql_exec_id, sql_exec_start,
+         case
+            when secs_from_exec_start < 5 then '00-04s'
+            when secs_from_exec_start < 10 then '05-09s'
+            when secs_from_exec_start < 20 then '10-19s'
+            when secs_from_exec_start < 30 then '20-29s'
+            when secs_from_exec_start < 45 then '30-44s'
+            when secs_from_exec_start < 60 then '45-59s'
+            else '60s+'
+         end
+order by sql_exec_start, instance_number, session_id, sql_exec_id, phase_bucket;
+
+prompt
+prompt =========================================================================
+prompt SECTION 6 - GEOGRAPHY OF THE EVENT
+prompt =========================================================================
+
+select *
+from (
+    select
+        instance_number,
+        nvl(module,'<null>') as module,
+        nvl(action,'<null>') as action,
+        nvl(machine,'<null>') as machine,
+        count(*) * 10 as wait_event_secs,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_event,
+        to_char(min(sample_time),'YYYY-MM-DD HH24:MI:SS') as first_seen,
+        to_char(max(sample_time),'YYYY-MM-DD HH24:MI:SS') as last_seen
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   nvl(event,'ON CPU') = trim('&&p_event_text')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    group by instance_number, module, action, machine
+    order by wait_event_secs desc, instance_number, module, action
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 7 - EVENT BY PLAN HASH VALUE
+prompt =========================================================================
+
+select
+    sql_plan_hash_value as plan_hash_value,
+    count(*) * 10 as wait_event_secs,
+    round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_event,
+    count(distinct case when sql_exec_start is not null and sql_exec_id is not null
+         then to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)||':'||
+              to_char(sql_exec_id)||':'||to_char(sql_exec_start,'YYYYMMDDHH24MISS') end) as executions_seen
+from dba_hist_active_sess_history
+where sql_id = trim('&&p_sql_id')
+and   nvl(event,'ON CPU') = trim('&&p_event_text')
+and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+group by sql_plan_hash_value
+order by wait_event_secs desc, plan_hash_value;
+
+prompt
+prompt =========================================================================
+prompt SECTION 8 - SIMPLIFIED HOTSPOT PLAN VIEW
+prompt =========================================================================
+prompt Read top to bottom. The highest wait_event_secs rows are the hottest lines.
+prompt =========================================================================
+
+with evt as (
+    select sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,1) as sql_plan_line_id, count(*) as event_samples
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   nvl(event,'ON CPU') = trim('&&p_event_text')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    group by sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,1)
+)
+select *
+from (
+    select
+        plan.plan_hash_value,
+        evt.event_samples * 10 as wait_event_secs,
+        round(ratio_to_report(evt.event_samples) over (partition by evt.sql_id, evt.sql_plan_hash_value) * 100, 2) as pct_of_event,
+        plan.id as line_id,
+        plan.parent_id,
+        lpad(' ', plan.depth, ' ') || plan.operation || ' ' || plan.options ||
+            nvl2(plan.object_name, ' ['||plan.object_name||']', null) as plan_line
+    from dba_hist_sql_plan plan
+    join evt
+      on evt.sql_id = plan.sql_id
+     and evt.sql_plan_hash_value = plan.plan_hash_value
+     and evt.sql_plan_line_id = plan.id
+    where plan.sql_id = trim('&&p_sql_id')
+    order by wait_event_secs desc, plan.plan_hash_value, plan.id
+)
+where rownum <= 50;
+
+prompt
+prompt =========================================================================
+prompt SECTION 9 - EVENT BY OBJECT
+prompt =========================================================================
+
+select *
+from (
+    select
+        nvl(o.owner,'<unknown>') as owner,
+        nvl(o.object_name,'<unknown>') as object_name,
+        nvl(o.subobject_name,'<none>') as subobject_name,
+        nvl(o.object_type,'<unknown>') as object_type,
+        count(*) * 10 as wait_event_secs,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_event
+    from dba_hist_active_sess_history a
+    left join dba_objects o
+      on o.object_id = a.current_obj#
+    where a.sql_id = trim('&&p_sql_id')
+    and   nvl(a.event,'ON CPU') = trim('&&p_event_text')
+    and   a.sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                             and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    and   a.current_obj# is not null
+    and   a.current_obj# <> -1
+    group by o.owner, o.object_name, o.subobject_name, o.object_type
+    order by wait_event_secs desc, owner, object_name
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 10 - BLOCKING VIEW FOR THE CHOSEN EVENT
+prompt =========================================================================
+
+select *
+from (
+    select
+        instance_number,
+        blocking_inst_id,
+        blocking_session,
+        blocking_session_serial#,
+        count(*) * 10 as wait_event_secs,
+        round(ratio_to_report(count(*)) over () * 100, 2) as pct_of_event
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   nvl(event,'ON CPU') = trim('&&p_event_text')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    and   blocking_session is not null
+    group by instance_number, blocking_inst_id, blocking_session, blocking_session_serial#
+    order by wait_event_secs desc
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 11 - PX VIEW FOR THE CHOSEN EVENT
+prompt =========================================================================
+
+select
+    count(*) * 10 as px_secs,
+    count(distinct case when qc_session_id is not null
+                        then to_char(qc_instance_id)||':'||to_char(qc_session_id) end) as px_coord_count,
+    count(distinct case when session_type = 'BACKGROUND' and qc_session_id is not null
+                        then to_char(instance_number)||':'||to_char(session_id) end) as distinct_px_servers
+from dba_hist_active_sess_history
+where sql_id = trim('&&p_sql_id')
+and   nvl(event,'ON CPU') = trim('&&p_event_text')
+and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+and   qc_session_id is not null;
+
+prompt
+prompt =========================================================================
+prompt SECTION 12 - OPTIONAL REAL-TIME SQL MONITOR SNAPSHOT
+prompt =========================================================================
+prompt Rows appear only if a related execution is still visible in memory.
+prompt =========================================================================
+
+select *
+from (
+    select
+        sql_id,
+        sql_exec_id,
+        to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') as exec_start,
+        status as monitor_status,
+        sql_plan_hash_value as plan_hash_value,
+        round(elapsed_time/1e6,1) as monitor_elapsed_s,
+        round(cpu_time/1e6,1) as monitor_cpu_s,
+        round(user_io_wait_time/1e6,1) as monitor_io_s
+    from gv$sql_monitor
+    where sql_id = trim('&&p_sql_id')
+    order by sql_exec_start desc nulls last
+)
+where rownum <= &&p_top_n;
+
+prompt
+prompt =========================================================================
+prompt SECTION 13 - BARE BONES SUMMARY / LIKELY ROOT
+prompt =========================================================================
+
+with ash_all as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+    and   sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+),
+ash_evt as (
+    select *
+    from ash_all
+    where nvl(event,'ON CPU') = trim('&&p_event_text')
+),
+evt as (
+    select
+        count(*) * 10 as event_secs,
+        round(count(*) * 100 / nullif((select count(*) from ash_all),0), 2) as pct_of_total,
+        max(wait_class) keep (dense_rank last order by sample_time) as wait_class,
+        sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+        sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs,
+        count(distinct sql_plan_hash_value) as plan_hashes
+    from ash_evt
+),
+top_line as (
+    select max(wait_event_secs) as top_line_secs
+    from (
+        with evt_line as (
+            select sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,1) as sql_plan_line_id, count(*) * 10 as wait_event_secs
+            from ash_evt
+            group by sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,1)
+        )
+        select wait_event_secs from evt_line
+    )
+),
+top_obj as (
+    select max(wait_event_secs) as top_obj_secs
+    from (
+        select count(*) * 10 as wait_event_secs
+        from ash_evt a
+        where a.current_obj# is not null
+        and   a.current_obj# <> -1
+        group by a.current_obj#
+    )
+)
+select 1 as ord,
+       case
+         when e.blocked_secs > 0 then 'SMOKING_GUN = BLOCKING / CONTENTION'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'SMOKING_GUN = PX/RAC AMPLIFICATION'
+         when e.wait_class = 'User I/O' and nvl(l.top_line_secs,0) >= e.event_secs * 0.40 and nvl(o.top_obj_secs,0) >= e.event_secs * 0.40 then 'SMOKING_GUN = ACCESS PATH ON A SPECIFIC OBJECT'
+         when e.wait_class = 'Concurrency' then 'SMOKING_GUN = CONTENTION HOTSPOT'
+         when e.plan_hashes > 1 then 'SMOKING_GUN = PLAN-DEPENDENT WAIT'
+         else 'SMOKING_GUN = EVENT NEEDS EXECUTION-SPECIFIC REVIEW'
+       end as clue_header,
+       case
+         when e.blocked_secs > 0 then 'This event is strongly tied to blocking. Treat the SQL as a victim until proven otherwise.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'This event is tied to PX plus Cluster behavior. That usually means RAC block movement, PX skew, or cross-instance amplification.'
+         when e.wait_class = 'User I/O' and nvl(l.top_line_secs,0) >= e.event_secs * 0.40 and nvl(o.top_obj_secs,0) >= e.event_secs * 0.40 then 'This event points to one hot plan line and one hot object. That is usually the cleanest root-cause path.'
+         when e.wait_class = 'Concurrency' then 'This event points to contention, not just expensive SQL work.'
+         when e.plan_hashes > 1 then 'This wait is plan-sensitive. The bad executions may be tied to one plan rather than all executions.'
+         else 'This event needs execution-by-execution review to isolate the true outlier.'
+       end as notes,
+       case
+         when e.blocked_secs > 0 then 'Row lock / enqueue blocking; app concurrency pattern; victim SQL symptom.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'PX skew; hot blocks; cross-instance redistribution; RAC amplified plan line.'
+         when e.wait_class = 'User I/O' and nvl(l.top_line_secs,0) >= e.event_secs * 0.40 and nvl(o.top_obj_secs,0) >= e.event_secs * 0.40 then 'Bad access path; full/large scan; stale stats; pruning miss; one dominant segment.'
+         when e.wait_class = 'Concurrency' then 'Hot block / row lock / latch / mutex / buffer contention.'
+         when e.plan_hashes > 1 then 'Plan regression; bind-sensitive path; stats-driven instability.'
+         else 'Need narrower execution-specific review.' end as likely_causes,
+       case
+         when e.blocked_secs > 0 then 'Review SECTION 10 first. Then use sql_exec_forensics.sql on the owning execution from SECTION 4.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'Review SECTION 8 and SECTION 11 first. Then deep dive the top execution from SECTION 4.'
+         when e.wait_class = 'User I/O' and nvl(l.top_line_secs,0) >= e.event_secs * 0.40 and nvl(o.top_obj_secs,0) >= e.event_secs * 0.40 then 'Review SECTION 8 and SECTION 9 first. Confirm whether the same plan line and object dominate the bad executions.'
+         when e.wait_class = 'Concurrency' then 'Review SECTION 4 and SECTION 10 first.'
+         when e.plan_hashes > 1 then 'Compare executions by plan hash value using SECTION 4 and SECTION 7.'
+         else 'Use SECTION 4 to isolate one execution and then run sql_exec_forensics.sql.' end as next_step,
+       case
+         when e.blocked_secs > 0 then 'Check blocker chain, blocking SQL, app transaction ordering, DML overlap, and lock wait chronology.'
+         when e.px_secs > 0 and e.wait_class = 'Cluster' then 'Check plan-line ownership in SECTION 8, PX counts in SECTION 11, object in SECTION 9, and RAC / instance skew from triage.'
+         when e.wait_class = 'User I/O' and nvl(l.top_line_secs,0) >= e.event_secs * 0.40 and nvl(o.top_obj_secs,0) >= e.event_secs * 0.40 then 'Check stats freshness, partition pruning, index suitability, object growth, storage latency corroboration, and SQL Monitor if execution still live.'
+         when e.wait_class = 'Concurrency' then 'Check blockers, hot objects, hot plan lines, segment contention, and cursor-related contention outside this script.'
+         when e.plan_hashes > 1 then 'Check AWR per-exec view from triage, compare bad execution vs normal execution, inspect bind sensitivity / child cursors.'
+         else 'Check SECTION 3 and then use sql_exec_forensics.sql on top execution.' end as where_to_check
+from evt e
+cross join top_line l
+cross join top_obj o
+order by ord;
+
+prompt =========================================================================
+prompt USAGE
+prompt =========================================================================
+prompt   @sql_wait_forensics_xray.sql <sql_id> <from_ts> <to_ts> "<event_text>"
+prompt
+prompt Example:
+prompt   @sql_wait_forensics_xray.sql &&p_sql_id &&p_from_ts_raw &&p_to_ts_raw "&&p_event_text"
+prompt
+prompt Example with spool:
+prompt   spool sql_wait_forensics_xray_&&p_sql_id..lst
+prompt   @sql_wait_forensics_xray.sql &&p_sql_id &&p_from_ts_raw &&p_to_ts_raw "&&p_event_text"
+prompt   spool off
+prompt =========================================================================
+
+undefine p_sql_id
+undefine p_from_ts_raw
+undefine p_to_ts_raw
+undefine p_event_text
+undefine p_top_n
