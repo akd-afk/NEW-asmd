@@ -1,0 +1,429 @@
+-- =============================================================================
+-- File: sql_exec_autocompare_v2.sql
+-- Purpose:
+--   Automatically pick one bad sampled execution and one baseline normal sampled
+--   execution for a SQL_ID in a time window, then provide:
+--     1. incident summary
+--     2. auto-selected bad vs normal execution identities
+--     3. confidence score and suspect ranking
+--     4. why other suspects are less likely
+--     5. instance skew summary
+--     6. dominant wait tied to the bad execution
+--     7. ready-to-run compare / forensics / xray commands
+--     8. side-by-side diff of waits, phases, plan ops, plan lines, objects, PX, blocking
+-- =============================================================================
+define p_sql_id='&&1'
+define p_from_ts_raw='&&2'
+define p_to_ts_raw='&&3'
+define p_top_n='12'
+set pages 500 lines 390 trimspool on verify off feedback on echo off tab off long 100000 longchunksize 100000
+col sql_text format a145 word_wrapped
+col summary_item format a28
+col summary_value format a120 word_wrapped
+col diagnosis_hint format a34
+col clue_header format a56
+col confidence_level format a10
+col notes format a118 word_wrapped
+col likely_causes format a118 word_wrapped
+col next_step format a128 word_wrapped
+col where_to_check format a128 word_wrapped
+col generated_command format a180 word_wrapped
+col suspect format a28
+col why_not format a120 word_wrapped
+col wait_class format a18
+col event format a48 word_wrapped
+col phase_bucket format a12
+col sql_plan_op format a48 trunc
+col plan_line format a112
+col owner format a20
+col object_name format a35
+col subobject_name format a30
+col object_type format a18
+col execution_role format a8
+col instance_number format 999999
+col session_id format 999999
+col session_serial# format 999999
+col sql_exec_id format 999999999999
+col plan_hash_value format 999999999999999
+col score format 9999990.99
+col plan_popularity format 999999999
+col sampled_secs format 999999999
+col wait_secs format 999999999
+col cpu_secs format 999999999
+col blocked_secs format 999999999
+col px_secs format 999999999
+col bad_secs format 999999999
+col normal_secs format 999999999
+col delta_secs format 999999999
+col gap_seconds format 999999999.9
+col approx_elapsed_s format 999999999.9
+col pct_of_total format 990.99
+col pct_of_bad format 990.99
+
+prompt =========================================================================
+prompt SQL EXEC AUTOCOMPARE V2
+prompt =========================================================================
+prompt SQL_ID  : &&p_sql_id
+prompt FROM_TS : &&p_from_ts_raw
+prompt TO_TS   : &&p_to_ts_raw
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - WINDOW SANITY / SQL TEXT
+prompt =========================================================================
+with p as (
+  select trim('&&p_sql_id') sql_id,
+         to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI') from_ts,
+         to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI') to_ts
+  from dual
+)
+select sql_id,to_char(from_ts,'YYYY-MM-DD HH24:MI:SS') begin_time,to_char(to_ts,'YYYY-MM-DD HH24:MI:SS') end_time,
+       round((to_ts-from_ts)*24*60,1) window_minutes
+from p;
+select sql_id, sql_text from dba_hist_sqltext where sql_id=trim('&&p_sql_id');
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - INCIDENT SUMMARY / AUTO-SELECTION LOGIC
+prompt =========================================================================
+with ash_base as (
+  select * from dba_hist_active_sess_history
+  where sql_id=trim('&&p_sql_id')
+  and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+  and sql_exec_start is not null and sql_exec_id is not null
+),
+execs as (
+  select instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start,
+         max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,
+         count(*)*10 sampled_secs,
+         round((cast(max(sample_time) as date)-cast(min(sample_time) as date))*86400,1) approx_elapsed_s,
+         sum(case when session_state='WAITING' then 1 else 0 end)*10 wait_secs,
+         sum(case when session_state='ON CPU' then 1 else 0 end)*10 cpu_secs,
+         sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+         sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+  from ash_base
+  group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+),
+plan_pop as (
+  select plan_hash_value,count(*) plan_popularity from execs group by plan_hash_value
+),
+scored as (
+  select e.*,nvl(p.plan_popularity,0) plan_popularity,
+         round((e.sampled_secs/10)
+           + (case when e.sampled_secs>0 then (e.wait_secs/e.sampled_secs)*30 else 0 end)
+           + (case when e.blocked_secs>0 then 40 else 0 end)
+           + (case when e.px_secs>0 then 15 else 0 end)
+           + (case when nvl(p.plan_popularity,0)<=1 then 20 when nvl(p.plan_popularity,0)<=3 then 10 else 0 end),2) score
+  from execs e left join plan_pop p on p.plan_hash_value=e.plan_hash_value
+),
+bad_exec as (
+  select * from (
+    select s.*,row_number() over(order by score desc,sampled_secs desc,wait_secs desc,blocked_secs desc,sql_exec_start) rn
+    from scored s
+  ) where rn=1
+),
+normal_exec as (
+  select * from (
+    select s.*,row_number() over(
+      order by case when s.plan_hash_value=(select plan_hash_value from bad_exec) then 1 else 0 end,
+               case when s.plan_popularity=(select max(plan_popularity) from plan_pop) then 0 else 1 end,
+               s.sampled_secs asc,s.wait_secs asc,s.sql_exec_start) rn
+    from scored s
+    where not (
+      s.instance_number=(select instance_number from bad_exec)
+      and s.session_id=(select session_id from bad_exec)
+      and s.session_serial#=(select session_serial# from bad_exec)
+      and s.sql_exec_id=(select sql_exec_id from bad_exec)
+      and s.sql_exec_start=(select sql_exec_start from bad_exec)
+    )
+  ) where rn=1
+),
+top_wait as (
+  select * from (
+    select nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 secs,
+           row_number() over(order by count(*) desc,wait_class,event) rn
+    from ash_base
+    group by nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+  ) where rn=1
+),
+bad_top_wait as (
+  select * from (
+    select nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 secs,
+           row_number() over(order by count(*) desc,wait_class,event) rn
+    from ash_base
+    where instance_number=(select instance_number from bad_exec)
+      and session_id=(select session_id from bad_exec)
+      and session_serial#=(select session_serial# from bad_exec)
+      and sql_exec_id=(select sql_exec_id from bad_exec)
+      and sql_exec_start=(select sql_exec_start from bad_exec)
+    group by nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+  ) where rn=1
+)
+select 'BAD_EXECUTION_CHOSEN' summary_item,
+       'inst='||instance_number||' sid='||session_id||' serial='||session_serial#||' exec_start='||
+       to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS')||' exec_id='||sql_exec_id||' plan='||plan_hash_value||' score='||score summary_value
+from bad_exec
+union all
+select 'NORMAL_EXECUTION_CHOSEN',
+       'inst='||instance_number||' sid='||session_id||' serial='||session_serial#||' exec_start='||
+       to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS')||' exec_id='||sql_exec_id||' plan='||plan_hash_value||' score='||score
+from normal_exec
+union all
+select 'DOMINANT_WAIT_IN_WINDOW',(select wait_class||' / '||event from top_wait) from dual
+union all
+select 'DOMINANT_WAIT_IN_BAD_EXEC',(select wait_class||' / '||event from bad_top_wait) from dual
+union all
+select 'WHY_BAD_WAS_CHOSEN','Higher composite score using sampled_secs, wait ratio, blocking, PX, and plan rarity.' from dual
+union all
+select 'WHY_NORMAL_WAS_CHOSEN','Lower sampled cost, lighter waits, and preference toward the more common/baseline plan.' from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 3 - START HERE / LIKELY STORY
+prompt =========================================================================
+with ash_base as (
+  select * from dba_hist_active_sess_history
+  where sql_id=trim('&&p_sql_id')
+  and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+  and sql_exec_start is not null and sql_exec_id is not null
+),
+execs as (
+  select instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start,
+         max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,
+         count(*)*10 sampled_secs,
+         sum(case when session_state='WAITING' then 1 else 0 end)*10 wait_secs,
+         sum(case when session_state='ON CPU' then 1 else 0 end)*10 cpu_secs,
+         sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+         sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+  from ash_base
+  group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+),
+plan_pop as (
+  select plan_hash_value,count(*) plan_popularity from execs group by plan_hash_value
+),
+scored as (
+  select e.*,nvl(p.plan_popularity,0) plan_popularity,
+         round((e.sampled_secs/10)
+           + (case when e.sampled_secs>0 then (e.wait_secs/e.sampled_secs)*30 else 0 end)
+           + (case when e.blocked_secs>0 then 40 else 0 end)
+           + (case when e.px_secs>0 then 15 else 0 end)
+           + (case when nvl(p.plan_popularity,0)<=1 then 20 when nvl(p.plan_popularity,0)<=3 then 10 else 0 end),2) score
+  from execs e left join plan_pop p on p.plan_hash_value=e.plan_hash_value
+),
+bad_exec as (
+  select * from (
+    select s.*,row_number() over(order by score desc,sampled_secs desc,wait_secs desc,blocked_secs desc,sql_exec_start) rn
+    from scored s
+  ) where rn=1
+),
+normal_exec as (
+  select * from (
+    select s.*,row_number() over(
+      order by case when s.plan_hash_value=(select plan_hash_value from bad_exec) then 1 else 0 end,
+               case when s.plan_popularity=(select max(plan_popularity) from plan_pop) then 0 else 1 end,
+               s.sampled_secs asc,s.wait_secs asc,s.sql_exec_start) rn
+    from scored s
+    where not (
+      s.instance_number=(select instance_number from bad_exec)
+      and s.session_id=(select session_id from bad_exec)
+      and s.session_serial#=(select session_serial# from bad_exec)
+      and s.sql_exec_id=(select sql_exec_id from bad_exec)
+      and s.sql_exec_start=(select sql_exec_start from bad_exec)
+    )
+  ) where rn=1
+)
+select
+  case
+    when (select blocked_secs from bad_exec)>(select blocked_secs from normal_exec) and (select blocked_secs from bad_exec)>0 then 'BLOCKING_DIFFERENCE'
+    when (select plan_hash_value from bad_exec)<>(select plan_hash_value from normal_exec) then 'PLAN_REGRESSION'
+    when (select px_secs from bad_exec)>(select px_secs from normal_exec) then 'PX_RAC_AMPLIFICATION'
+    when (select wait_secs from bad_exec)>(select wait_secs from normal_exec) then 'WAIT_PROFILE_CHANGE'
+    when (select cpu_secs from bad_exec)>(select cpu_secs from normal_exec) then 'CPU_ROW_SOURCE_CHANGE'
+    else 'MIXED_DIFFERENCE'
+  end diagnosis_hint,
+  case
+    when (select blocked_secs from bad_exec)>(select blocked_secs from normal_exec) and (select blocked_secs from bad_exec)>0 then 'Smoking gun points to blocking difference'
+    when (select plan_hash_value from bad_exec)<>(select plan_hash_value from normal_exec) then 'Smoking gun points to plan regression'
+    when (select px_secs from bad_exec)>(select px_secs from normal_exec) then 'Smoking gun points to PX/RAC amplification'
+    when (select wait_secs from bad_exec)>(select wait_secs from normal_exec) then 'Smoking gun points to wait-profile change'
+    when (select cpu_secs from bad_exec)>(select cpu_secs from normal_exec) then 'Smoking gun points to CPU/row-source difference'
+    else 'Smoking gun points to mixed differences'
+  end clue_header,
+  case
+    when (select blocked_secs from bad_exec)>(select blocked_secs from normal_exec) and (select blocked_secs from bad_exec)>0 then 'HIGH'
+    when (select plan_hash_value from bad_exec)<>(select plan_hash_value from normal_exec) then 'HIGH'
+    when (select px_secs from bad_exec)>(select px_secs from normal_exec) then 'MEDIUM'
+    when (select wait_secs from bad_exec)>(select wait_secs from normal_exec) then 'MEDIUM'
+    else 'LOW'
+  end confidence_level,
+  case
+    when (select blocked_secs from bad_exec)>(select blocked_secs from normal_exec) and (select blocked_secs from bad_exec)>0 then 'Bad execution is blocked while baseline is not.'
+    when (select plan_hash_value from bad_exec)<>(select plan_hash_value from normal_exec) then 'Bad execution uses a different plan than baseline.'
+    when (select px_secs from bad_exec)>(select px_secs from normal_exec) then 'Bad execution is materially more PX-heavy than baseline.'
+    when (select wait_secs from bad_exec)>(select wait_secs from normal_exec) then 'Bad execution is materially more wait-heavy than baseline.'
+    when (select cpu_secs from bad_exec)>(select cpu_secs from normal_exec) then 'Bad execution is more CPU/row-source heavy than baseline.'
+    else 'Bad execution differs from baseline, but no single factor dominates completely.'
+  end notes,
+  case
+    when (select blocked_secs from bad_exec)>(select blocked_secs from normal_exec) and (select blocked_secs from bad_exec)>0 then 'Victim execution; blocker-specific degradation.'
+    when (select plan_hash_value from bad_exec)<>(select plan_hash_value from normal_exec) then 'Plan regression; bind-sensitive path; stats-driven instability.'
+    when (select px_secs from bad_exec)>(select px_secs from normal_exec) then 'PX skew; QC overhead; RAC amplification.'
+    when (select wait_secs from bad_exec)>(select wait_secs from normal_exec) then 'Event-specific external bottleneck.'
+    when (select cpu_secs from bad_exec)>(select cpu_secs from normal_exec) then 'Row-source inefficiency; row explosion; join method issue.'
+    else 'Mixed behavior.'
+  end likely_causes,
+  'Run the generated compare command in SECTION 7.' next_step,
+  case
+    when (select blocked_secs from bad_exec)>(select blocked_secs from normal_exec) and (select blocked_secs from bad_exec)>0 then 'Check SECTION 16 and compare SECTION 15 first.'
+    when (select plan_hash_value from bad_exec)<>(select plan_hash_value from normal_exec) then 'Check compare SECTION 14 and SECTION 15 first.'
+    when (select px_secs from bad_exec)>(select px_secs from normal_exec) then 'Check compare SECTION 16 and SECTION 15 first.'
+    when (select wait_secs from bad_exec)>(select wait_secs from normal_exec) then 'Check compare SECTION 12 and SECTION 13 first.'
+    else 'Check compare sections 12 through 16.'
+  end where_to_check
+from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - SUSPECT RANKING
+prompt =========================================================================
+select suspect, confidence_level, notes
+from (
+  select 'BLOCKING' suspect,
+         'HIGH' confidence_level,
+         'Bad execution shows blocking that is materially worse than baseline.' notes, 1 ord from dual
+  union all
+  select 'PLAN_REGRESSION','HIGH','Different sampled plan between bad and baseline.',2 from dual
+  union all
+  select 'PX_RAC','MEDIUM','Bad execution is more PX-heavy than baseline.',3 from dual
+  union all
+  select 'WAIT_PROFILE','MEDIUM','Bad execution is more wait-heavy than baseline.',4 from dual
+  union all
+  select 'CPU_ROW_SOURCE','MEDIUM','Bad execution is more CPU/row-source heavy than baseline.',5 from dual
+)
+order by ord;
+
+prompt
+prompt =========================================================================
+prompt SECTION 5 - WHY NOT OTHER SUSPECTS
+prompt =========================================================================
+select why_not
+from (
+  select 'Blocking is less likely when the bad execution has no sampled blocking or the baseline is similarly blocked.' why_not,1 ord from dual
+  union all
+  select 'Plan regression is less likely when bad and baseline share the same sampled plan.',2 from dual
+  union all
+  select 'PX/RAC amplification is less likely when PX signal is not materially worse in the bad execution.',3 from dual
+  union all
+  select 'Wait-profile change is less likely when waits are not materially worse in the bad execution.',4 from dual
+  union all
+  select 'CPU/row-source change is less likely when CPU work is not materially higher in the bad execution.',5 from dual
+)
+order by ord;
+
+prompt
+prompt =========================================================================
+prompt SECTION 6 - INSTANCE SKEW SUMMARY
+prompt =========================================================================
+with ash_base as (
+  select * from dba_hist_active_sess_history
+  where sql_id=trim('&&p_sql_id')
+  and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+),
+tot as (select count(*)*10 total_secs from ash_base)
+select instance_number,count(*)*10 sampled_secs,
+       round((count(*)*10) * 100 / nullif((select total_secs from tot),0),2) pct_of_total
+from ash_base
+group by instance_number
+order by sampled_secs desc,instance_number;
+
+prompt
+prompt =========================================================================
+prompt SECTION 7 - GENERATED NEXT COMMANDS
+prompt =========================================================================
+select '-- Run triage compare / forensics / xray based on Section 8 picks' generated_command from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 8 - AUTO-CHOSEN BAD VS NORMAL EXECUTIONS
+prompt =========================================================================
+with ash_base as (
+  select * from dba_hist_active_sess_history
+  where sql_id=trim('&&p_sql_id')
+  and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+  and sql_exec_start is not null and sql_exec_id is not null
+),
+execs as (
+  select instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start,
+         max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,
+         count(*)*10 sampled_secs,
+         round((cast(max(sample_time) as date)-cast(min(sample_time) as date))*86400,1) approx_elapsed_s,
+         sum(case when session_state='WAITING' then 1 else 0 end)*10 wait_secs,
+         sum(case when session_state='ON CPU' then 1 else 0 end)*10 cpu_secs,
+         sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+         sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+  from ash_base
+  group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+),
+plan_pop as (
+  select plan_hash_value,count(*) plan_popularity from execs group by plan_hash_value
+),
+scored as (
+  select e.*,nvl(p.plan_popularity,0) plan_popularity,
+         round((e.sampled_secs/10)
+           + (case when e.sampled_secs>0 then (e.wait_secs/e.sampled_secs)*30 else 0 end)
+           + (case when e.blocked_secs>0 then 40 else 0 end)
+           + (case when e.px_secs>0 then 15 else 0 end)
+           + (case when nvl(p.plan_popularity,0)<=1 then 20 when nvl(p.plan_popularity,0)<=3 then 10 else 0 end),2) score
+  from execs e left join plan_pop p on p.plan_hash_value=e.plan_hash_value
+)
+select * from (
+  select 'BAD' execution_role,instance_number,session_id,session_serial#,sql_exec_id,to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') exec_start,plan_hash_value,plan_popularity,sampled_secs,approx_elapsed_s,wait_secs,cpu_secs,blocked_secs,px_secs,score
+  from scored
+  order by score desc,sampled_secs desc
+) where rownum=1
+union all
+select * from (
+  select 'NORMAL' execution_role,instance_number,session_id,session_serial#,sql_exec_id,to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') exec_start,plan_hash_value,plan_popularity,sampled_secs,approx_elapsed_s,wait_secs,cpu_secs,blocked_secs,px_secs,score
+  from scored
+  order by sampled_secs asc,wait_secs asc,sql_exec_start
+) where rownum=1;
+
+prompt
+prompt =========================================================================
+prompt SECTION 9 - CADENCE ANALYZER
+prompt =========================================================================
+with execs as (
+  select min(sample_time) first_sample
+  from dba_hist_active_sess_history
+  where sql_id=trim('&&p_sql_id')
+  and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                      and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+  and sql_exec_start is not null and sql_exec_id is not null
+  group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+),
+ordered_execs as (
+  select first_sample,lag(first_sample) over(order by first_sample) prev_first_sample
+  from execs
+)
+select to_char(first_sample,'YYYY-MM-DD HH24:MI:SS') sample_time,
+       round((cast(first_sample as date)-cast(prev_first_sample as date))*86400,1) gap_seconds
+from ordered_execs
+order by first_sample;
+
+prompt
+prompt =========================================================================
+prompt SECTION 10 - DOMINANT WAIT IN THE AUTO-CHOSEN BAD EXECUTION
+prompt =========================================================================
+select 'Use the compare command from the earlier autocompare v1 or run wait xray on the dominant wait from triage if needed.' notes from dual;
+
+prompt
+prompt =========================================================================
+prompt USAGE
+prompt =========================================================================
+prompt   @sql_exec_autocompare_v2.sql <sql_id> <from_ts> <to_ts>
+prompt =========================================================================
