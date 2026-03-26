@@ -1,0 +1,78 @@
+-- =============================================================================
+-- File: sql_exec_launcher_v1.sql
+-- Purpose:
+--   One-command entry point for the SQL incident framework.
+--
+-- What it does:
+--   1. Runs triage
+--   2. Runs autocompare
+--   3. Prints the recommended follow-up flow
+--
+-- Usage:
+--   @sql_exec_launcher_v1.sql <sql_id> <from_ts> <to_ts>
+--
+-- Example:
+--   @sql_exec_launcher_v1.sql 1abcxyz123456 2026-03-21_05:00 2026-03-21_09:30
+--
+-- Timestamp format:
+--   YYYY-MM-DD_HH24:MI
+--
+-- Notes:
+--   - Keep this launcher in the same directory as the framework scripts, or
+--     adjust the @@ paths below.
+--   - This launcher does not guess the exact follow-up execution parameters for
+--     forensics; use the generated commands shown by triage/autocompare.
+-- =============================================================================
+
+define p_sql_id      = '&&1'
+define p_from_ts_raw = '&&2'
+define p_to_ts_raw   = '&&3'
+
+set verify off
+set feedback on
+set echo off
+set pages 200
+set lines 250
+
+prompt =========================================================================
+prompt SQL INCIDENT LAUNCHER V1
+prompt =========================================================================
+prompt SQL_ID  : &&p_sql_id
+prompt FROM_TS : &&p_from_ts_raw
+prompt TO_TS   : &&p_to_ts_raw
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt STEP 1 - TRIAGE
+prompt =========================================================================
+@@sql_exec_triage_v3.sql &&p_sql_id &&p_from_ts_raw &&p_to_ts_raw
+
+prompt
+prompt =========================================================================
+prompt STEP 2 - AUTO COMPARE
+prompt =========================================================================
+@@sql_exec_autocompare_v2.sql &&p_sql_id &&p_from_ts_raw &&p_to_ts_raw
+
+prompt
+prompt =========================================================================
+prompt STEP 3 - FOLLOW-UP DECISION TREE
+prompt =========================================================================
+prompt Use the generated commands from the two reports above.
+prompt
+prompt Common path:
+prompt   1. Start with triage output
+prompt   2. Review autocompare output
+prompt   3. If one bad execution is clear, run sql_exec_forensics_v2.sql
+prompt   4. If one dominant wait is clear, run sql_wait_forensics_xray_v2.sql
+prompt   5. If you need hard proof, run sql_exec_compare_v1.sql
+prompt
+prompt Examples:
+prompt   @sql_exec_forensics_v2.sql <sql_id> <inst_id> <sid> <serial#> <exec_start_ts> <sql_exec_id>
+prompt   @sql_wait_forensics_xray_v2.sql <sql_id> <from_ts> <to_ts> "<event_text>"
+prompt   @sql_exec_compare_v1.sql <sql_id> <bad_inst> <bad_sid> <bad_serial> <bad_exec_start_ts> <bad_sql_exec_id> <good_inst> <good_sid> <good_serial> <good_exec_start_ts> <good_sql_exec_id>
+prompt =========================================================================
+
+undefine p_sql_id
+undefine p_from_ts_raw
+undefine p_to_ts_raw
