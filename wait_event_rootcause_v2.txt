@@ -1,0 +1,623 @@
+-- =============================================================================
+-- File: wait_event_rootcause_v2.txt
+-- Purpose:
+--   Historical RCA drilldown by WAIT EVENT + TIME WINDOW, without requiring SQL_ID.
+--   Adds CPU pressure and PX pressure sections for events like resmgr:cpu quantum.
+--
+-- Usage:
+--   @wait_event_rootcause_v2.txt <from_ts> <to_ts> "<event_filter>"
+--
+-- Example:
+--   @wait_event_rootcause_v2.txt 2026-03-25_02:00 2026-03-25_02:05 "resmgr:cpu quantum"
+-- =============================================================================
+
+define p_from_ts_raw  = '&&1'
+define p_to_ts_raw    = '&&2'
+define p_event_filter = '&&3'
+define p_top_n        = '20'
+
+set pages 500
+set lines 400
+set trimspool on
+set verify off
+set feedback on
+set echo off
+set tab off
+
+col section               format a34
+col value                 format a150 word_wrapped
+col wait_class            format a18
+col event                 format a45 word_wrapped
+col sql_id                format a15
+col module                format a24 trunc
+col action                format a34 trunc
+col machine               format a30 trunc
+col program               format a32 trunc
+col owner                 format a20
+col object_name           format a38
+col subobject_name        format a24
+col object_type           format a18
+col operation             format a28
+col options               format a24
+col plan_line             format a120
+col generated_command     format a160 word_wrapped
+
+col instance_number       format 99999
+col session_id            format 999999
+col session_serial#       format 999999
+col sql_exec_id           format 999999999999
+col plan_hash_value       format 999999999999999
+col sample_cnt            format 999999999
+col sampled_secs          format 999999999
+col wait_pct              format 990.99
+col px_secs               format 999999999
+col blocked_secs          format 999999999
+col distinct_sessions     format 999999
+col peak_active_sessions  format 999999999
+col peak_event_sessions   format 999999999
+col cpu_count_total       format 999999
+col px_target_total       format 999999
+col px_cap_total          format 999999
+
+prompt =========================================================================
+prompt WAIT EVENT ROOTCAUSE V2
+prompt =========================================================================
+prompt FROM_TS      : &&p_from_ts_raw
+prompt TO_TS        : &&p_to_ts_raw
+prompt EVENT_FILTER : &&p_event_filter
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - WINDOW / EVENT SANITY
+prompt =========================================================================
+
+with p as (
+    select to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') as from_ts,
+           to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI') as to_ts,
+           trim('&&p_event_filter') as event_filter
+    from dual
+),
+ash_evt as (
+    select *
+    from dba_hist_active_sess_history
+    where sample_time between (select from_ts from p) and (select to_ts from p)
+      and lower(nvl(event,'ON CPU')) like '%'||lower((select event_filter from p))||'%'
+)
+select 'WINDOW_START' as section, to_char((select from_ts from p), 'YYYY-MM-DD HH24:MI:SS') as value from dual
+union all
+select 'WINDOW_END', to_char((select to_ts from p), 'YYYY-MM-DD HH24:MI:SS') from dual
+union all
+select 'EVENT_FILTER', (select event_filter from p) from dual
+union all
+select 'MATCHING_ASH_ROWS', to_char((select count(*) from ash_evt)) from dual
+union all
+select 'MATCHING_SAMPLED_SECONDS', to_char((select count(*)*10 from ash_evt)) from dual
+union all
+select 'DISTINCT_SESSIONS',
+       to_char((select count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)) from ash_evt))
+from dual
+union all
+select 'DISTINCT_SQL_IDS',
+       to_char((select count(distinct sql_id) from ash_evt where sql_id is not null))
+from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - ISSUE FAMILY / FIRST INTERPRETATION
+prompt =========================================================================
+
+select 'ISSUE_FAMILY' as section,
+       case
+         when lower(trim('&&p_event_filter')) like '%resmgr:cpu quantum%' then 'CPU_THROTTLING'
+         when lower(trim('&&p_event_filter')) like 'gc%' or lower(trim('&&p_event_filter')) like '%gc %' then 'RAC_CLUSTER_CONTENTION'
+         when lower(trim('&&p_event_filter')) like 'enq:%' then 'BLOCKING_OR_ENQUEUE'
+         when lower(trim('&&p_event_filter')) like '%temp%' then 'TEMP_SPILL'
+         when lower(trim('&&p_event_filter')) like '%log file sync%' then 'COMMIT_LOG_SYNC'
+         else 'GENERAL_WAIT_SPIKE'
+       end as value
+from dual
+union all
+select 'FIRST_INTERPRETATION',
+       case
+         when lower(trim('&&p_event_filter')) like '%resmgr:cpu quantum%' then
+           'Resource Manager is throttling runnable sessions. Primary suspects are CPU pressure, high concurrency, and PX overlap.'
+         when lower(trim('&&p_event_filter')) like 'gc%' or lower(trim('&&p_event_filter')) like '%gc %' then
+           'This points to RAC interconnect/global-cache pressure. Hot objects, hot plan lines, and PX/RAC amplification are primary suspects.'
+         when lower(trim('&&p_event_filter')) like 'enq:%' then
+           'This points to blocking or enqueue pressure. Review blockers and top executions.'
+         when lower(trim('&&p_event_filter')) like '%temp%' then
+           'This points to temp spill behavior. Review PX and plan-line hotspots.'
+         else
+           'Use SQL, execution, object, plan-line, CPU, and PX sections together. Do not conclude root cause from the event text alone.'
+       end
+from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 3 - EVENT DISTRIBUTION WITHIN FILTER
+prompt =========================================================================
+
+with ash_evt as (
+    select nvl(wait_class,'<null>') as wait_class,
+           nvl(event,'<null>') as event,
+           count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+    group by nvl(wait_class,'<null>'), nvl(event,'<null>')
+),
+tot as (
+    select sum(sample_cnt) as total_samples from ash_evt
+)
+select wait_class,
+       event,
+       sample_cnt,
+       sample_cnt*10 as sampled_secs,
+       round(sample_cnt * 100 / nullif((select total_samples from tot),0), 2) as wait_pct
+from ash_evt
+order by sample_cnt desc, wait_class, event;
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - CPU PRESSURE / ACTIVE SESSION PRESSURE
+prompt =========================================================================
+
+with all_ash as (
+    select sample_time,
+           count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)) as active_sessions
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    group by sample_time
+),
+evt_ash as (
+    select sample_time,
+           count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)) as event_sessions
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+    group by sample_time
+),
+cpu_ref as (
+    select sum(to_number(value)) as cpu_count_total
+    from gv$parameter
+    where name = 'cpu_count'
+)
+select 'CURRENT_CPU_COUNT_REFERENCE' as section, to_char((select cpu_count_total from cpu_ref)) as value from dual
+union all
+select 'PEAK_ACTIVE_SESSIONS_IN_WINDOW', to_char(nvl((select max(active_sessions) from all_ash),0)) from dual
+union all
+select 'PEAK_MATCHING_EVENT_SESSIONS', to_char(nvl((select max(event_sessions) from evt_ash),0)) from dual
+union all
+select 'ACTIVE_SESSIONS_TO_CPU_RATIO',
+       to_char(round(nvl((select max(active_sessions) from all_ash),0) / nullif((select cpu_count_total from cpu_ref),0), 2))
+from dual
+union all
+select 'EVENT_SESSIONS_TO_CPU_RATIO',
+       to_char(round(nvl((select max(event_sessions) from evt_ash),0) / nullif((select cpu_count_total from cpu_ref),0), 2))
+from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 5 - TOP SQL IDS INVOLVED IN THE SPIKE
+prompt =========================================================================
+
+with ash_evt as (
+    select sql_id,
+           count(*) as sample_cnt,
+           count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)) as distinct_sessions,
+           sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs,
+           sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and sql_id is not null
+    group by sql_id
+),
+tot as (
+    select sum(sample_cnt) as total_samples from ash_evt
+)
+select *
+from (
+    select sql_id,
+           sample_cnt,
+           sample_cnt*10 as sampled_secs,
+           round(sample_cnt * 100 / nullif((select total_samples from tot),0), 2) as wait_pct,
+           distinct_sessions,
+           px_secs,
+           blocked_secs,
+           '@sql_exec_inventory_v4.txt '||sql_id||' '||'&&p_from_ts_raw'||' '||'&&p_to_ts_raw' as generated_command
+    from ash_evt
+    order by sample_cnt desc, sql_id
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 6 - TOP EXECUTIONS INVOLVED IN THE SPIKE
+prompt =========================================================================
+
+with ash_evt as (
+    select instance_number,
+           session_id,
+           session_serial#,
+           sql_id,
+           sql_exec_id,
+           sql_exec_start,
+           max(sql_plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value,
+           max(module) keep (dense_rank last order by sample_time) as module,
+           max(action) keep (dense_rank last order by sample_time) as action,
+           max(machine) keep (dense_rank last order by sample_time) as machine,
+           max(program) keep (dense_rank last order by sample_time) as program,
+           count(*) as sample_cnt,
+           sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs,
+           sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and sql_exec_id is not null
+      and sql_exec_start is not null
+    group by instance_number, session_id, session_serial#, sql_id, sql_exec_id, sql_exec_start
+)
+select *
+from (
+    select instance_number,
+           session_id,
+           session_serial#,
+           sql_id,
+           sql_exec_id,
+           to_char(sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') as exec_start,
+           plan_hash_value,
+           module,
+           action,
+           machine,
+           program,
+           sample_cnt,
+           sample_cnt*10 as sampled_secs,
+           px_secs,
+           blocked_secs,
+           '@sql_exec_diagnose_v4.txt '||sql_id||' '||
+           to_char(sql_exec_start, 'YYYY-MM-DD_HH24:MI:SS')||' '||
+           sql_exec_id as generated_command
+    from ash_evt
+    order by sample_cnt desc, px_secs desc, blocked_secs desc, exec_start
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 7 - TOP OBJECTS SEEN DURING THE SPIKE
+prompt =========================================================================
+
+with ash_evt as (
+    select current_obj#, count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and current_obj# is not null
+      and current_obj# <> -1
+    group by current_obj#
+)
+select *
+from (
+    select nvl(o.owner,'<unknown>') as owner,
+           nvl(o.object_name,'<unknown>') as object_name,
+           nvl(o.subobject_name,'<none>') as subobject_name,
+           nvl(o.object_type,'<unknown>') as object_type,
+           a.sample_cnt,
+           a.sample_cnt*10 as sampled_secs
+    from ash_evt a
+    left join dba_objects o
+      on o.object_id = a.current_obj#
+    order by a.sample_cnt desc, owner, object_name
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 8 - PLAN LINE / OPERATION HOTSPOTS
+prompt =========================================================================
+
+with ash_evt as (
+    select sql_id,
+           sql_plan_hash_value,
+           nvl(sql_plan_line_id,-1) as sql_plan_line_id,
+           count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and sql_id is not null
+    group by sql_id, sql_plan_hash_value, nvl(sql_plan_line_id,-1)
+)
+select *
+from (
+    select a.sql_id,
+           a.sql_plan_hash_value as plan_hash_value,
+           a.sql_plan_line_id,
+           p.operation,
+           p.options,
+           lpad(' ', p.depth, ' ') || p.operation || ' ' || p.options ||
+           nvl2(p.object_name, ' ['||p.object_name||']', null) as plan_line,
+           a.sample_cnt,
+           a.sample_cnt*10 as sampled_secs
+    from ash_evt a
+    left join dba_hist_sql_plan p
+      on p.sql_id = a.sql_id
+     and p.plan_hash_value = a.sql_plan_hash_value
+     and p.id = a.sql_plan_line_id
+    order by a.sample_cnt desc, a.sql_id, a.sql_plan_line_id
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 9 - BLOCKING SIGNALS DURING THE SPIKE
+prompt =========================================================================
+
+with ash_evt as (
+    select instance_number,
+           session_id,
+           session_serial#,
+           blocking_inst_id,
+           blocking_session,
+           blocking_session_serial#,
+           sql_id,
+           count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and blocking_session is not null
+    group by instance_number, session_id, session_serial#, blocking_inst_id, blocking_session, blocking_session_serial#, sql_id
+)
+select *
+from (
+    select instance_number,
+           session_id,
+           session_serial#,
+           blocking_inst_id,
+           blocking_session,
+           blocking_session_serial#,
+           sql_id,
+           sample_cnt,
+           sample_cnt*10 as sampled_secs
+    from ash_evt
+    order by sample_cnt desc, sql_id
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 10 - PX / PARALLELISM CAPACITY AND PRESSURE
+prompt =========================================================================
+
+with px_rows as (
+    select sample_time,
+           sql_id,
+           qc_instance_id,
+           qc_session_id,
+           session_type,
+           instance_number,
+           session_id,
+           session_serial#
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and qc_session_id is not null
+),
+px_per_second as (
+    select sample_time, count(*) as px_rows_this_second
+    from px_rows
+    group by sample_time
+),
+cpu_ref as (
+    select sum(to_number(value)) as cpu_count_total
+    from gv$parameter
+    where name = 'cpu_count'
+),
+px_ref as (
+    select sum(case when name='parallel_servers_target' then to_number(value) else 0 end) as px_target_total,
+           sum(case when name='parallel_max_servers' then to_number(value) else 0 end) as px_cap_total
+    from gv$parameter
+    where name in ('parallel_servers_target','parallel_max_servers')
+),
+px_qc_count as (
+    select count(distinct to_char(qc_instance_id)||':'||to_char(qc_session_id)) as distinct_qcs
+    from px_rows
+),
+px_slave_count as (
+    select count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)) as distinct_px_slaves
+    from px_rows
+    where session_type = 'BACKGROUND'
+)
+select 'CURRENT_CPU_COUNT_REFERENCE' as section, to_char((select cpu_count_total from cpu_ref)) as value from dual
+union all
+select 'CURRENT_PARALLEL_SERVERS_TARGET', to_char((select px_target_total from px_ref)) from dual
+union all
+select 'CURRENT_PARALLEL_MAX_SERVERS', to_char((select px_cap_total from px_ref)) from dual
+union all
+select 'PX_ROWS_IN_EVENT_WINDOW', to_char((select count(*) from px_rows)) from dual
+union all
+select 'PX_SAMPLED_SECONDS', to_char((select count(*)*10 from px_rows)) from dual
+union all
+select 'DISTINCT_QC_SESSIONS', to_char((select distinct_qcs from px_qc_count)) from dual
+union all
+select 'DISTINCT_PX_SLAVES', to_char((select distinct_px_slaves from px_slave_count)) from dual
+union all
+select 'PEAK_PX_SAMPLE_ROWS_ONE_SECOND', to_char(nvl((select max(px_rows_this_second) from px_per_second),0)) from dual
+union all
+select 'PEAK_PX_ROWS_TO_CPU_RATIO',
+       to_char(round(nvl((select max(px_rows_this_second) from px_per_second),0) / nullif((select cpu_count_total from cpu_ref),0), 2))
+from dual
+union all
+select 'PEAK_PX_ROWS_TO_PX_TARGET_RATIO',
+       to_char(round(nvl((select max(px_rows_this_second) from px_per_second),0) / nullif((select px_target_total from px_ref),0), 2))
+from dual;
+
+prompt
+prompt =========================================================================
+prompt SECTION 11 - PX COORDINATORS / TOP SQLS UNDER PX
+prompt =========================================================================
+
+with ash_evt as (
+    select sql_id,
+           qc_instance_id,
+           qc_session_id,
+           count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and qc_session_id is not null
+    group by sql_id, qc_instance_id, qc_session_id
+)
+select *
+from (
+    select sql_id, qc_instance_id, qc_session_id, sample_cnt, sample_cnt*10 as sampled_secs
+    from ash_evt
+    order by sample_cnt desc, sql_id
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 12 - HISTORICAL PLAN CONTEXT FOR TOP SQL IDS
+prompt =========================================================================
+
+with top_sqls as (
+    select *
+    from (
+        select sql_id, count(*) as sample_cnt
+        from dba_hist_active_sess_history
+        where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+          and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+          and sql_id is not null
+        group by sql_id
+        order by sample_cnt desc, sql_id
+    )
+    where rownum <= 5
+),
+hist as (
+    select s.sql_id,
+           s.plan_hash_value,
+           sum(nvl(s.executions_delta,0)) as execs,
+           round(sum(nvl(s.elapsed_time_delta,0)) / nullif(sum(nvl(s.executions_delta,0)),0) / 1000, 2) as avg_ela_ms_exec,
+           round(sum(nvl(s.cpu_time_delta,0))     / nullif(sum(nvl(s.executions_delta,0)),0) / 1000, 2) as avg_cpu_ms_exec,
+           round(sum(nvl(s.buffer_gets_delta,0))  / nullif(sum(nvl(s.executions_delta,0)),0), 2) as avg_lio_exec,
+           round(sum(nvl(s.disk_reads_delta,0))   / nullif(sum(nvl(s.executions_delta,0)),0), 2) as avg_pio_exec
+    from dba_hist_sqlstat s
+    where s.sql_id in (select sql_id from top_sqls)
+    group by s.sql_id, s.plan_hash_value
+)
+select *
+from (
+    select sql_id, plan_hash_value, execs, avg_ela_ms_exec, avg_cpu_ms_exec, avg_lio_exec, avg_pio_exec
+    from hist
+    order by sql_id, execs desc, avg_ela_ms_exec desc nulls last
+)
+where rownum <= 50;
+
+prompt
+prompt =========================================================================
+prompt SECTION 13 - INTERPRETED FINDINGS / NEXT STEPS
+prompt =========================================================================
+
+with top_sql as (
+    select *
+    from (
+        select sql_id,
+               count(*) as sample_cnt,
+               sum(case when qc_session_id is not null then 1 else 0 end) as px_rows,
+               sum(case when blocking_session is not null then 1 else 0 end) as blocking_rows
+        from dba_hist_active_sess_history
+        where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                              and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+          and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+          and sql_id is not null
+        group by sql_id
+        order by sample_cnt desc, sql_id
+    )
+    where rownum = 1
+),
+cpu_ref as (
+    select sum(to_number(value)) as cpu_count_total
+    from gv$parameter
+    where name = 'cpu_count'
+),
+all_ash as (
+    select sample_time,
+           count(distinct to_char(instance_number)||':'||to_char(session_id)||':'||to_char(session_serial#)) as active_sessions
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+    group by sample_time
+),
+peak_all as (
+    select nvl(max(active_sessions),0) as peak_active_sessions from all_ash
+),
+px_rows as (
+    select sample_time, count(*) as px_rows_this_second
+    from dba_hist_active_sess_history
+    where sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and lower(nvl(event,'ON CPU')) like '%'||lower(trim('&&p_event_filter'))||'%'
+      and qc_session_id is not null
+    group by sample_time
+),
+peak_px as (
+    select nvl(max(px_rows_this_second),0) as peak_px_rows from px_rows
+)
+select 'PRIMARY_INTERPRETATION' as section,
+       case
+         when lower(trim('&&p_event_filter')) like '%resmgr:cpu quantum%' then
+           'Treat this as CPU throttling until proven otherwise. If active-session-to-CPU ratio and PX-to-CPU ratio are high, the likely root cause is PX/concurrency overcommit rather than one isolated SQL.'
+         when lower(trim('&&p_event_filter')) like 'gc%' or lower(trim('&&p_event_filter')) like '%gc %' then
+           'Treat this as RAC cluster pressure until proven otherwise. Chase hot SQLs, hot objects, hot plan lines, and PX signal together.'
+         when lower(trim('&&p_event_filter')) like 'enq:%' then
+           'Treat this as blocking/enqueue pressure until proven otherwise. Review blockers and top executions first.'
+         else
+           'Treat the event as a clue. Use SQL, execution, object, plan-line, CPU pressure, and PX sections together.'
+       end as value
+from dual
+union all
+select 'TOP_SQL_TO_CHASE_FIRST', nvl((select sql_id from top_sql), '<none>') from dual
+union all
+select 'CPU_PRESSURE_RATIO_HINT',
+       'Peak active sessions / CPU count = '||
+       to_char(round((select peak_active_sessions from peak_all) / nullif((select cpu_count_total from cpu_ref),0), 2))
+from dual
+union all
+select 'PEAK_PX_ROWS_TO_CPU_HINT',
+       'Peak PX rows per sample / CPU count = '||
+       to_char(round((select peak_px_rows from peak_px) / nullif((select cpu_count_total from cpu_ref),0), 2))
+from dual
+union all
+select 'PX_SIGNAL_IN_THIS_SPIKE',
+       case when nvl((select px_rows from top_sql),0) > 0 then 'YES - PX was sampled during the spike' else 'NO - PX was not sampled during the spike' end
+from dual
+union all
+select 'BLOCKING_SIGNAL_IN_THIS_SPIKE',
+       case when nvl((select blocking_rows from top_sql),0) > 0 then 'YES - blocking was sampled during the spike' else 'NO - blocking was not sampled during the spike' end
+from dual
+union all
+select 'NEXT_STEPS',
+       '1) run the generated inventory command for the top SQL, 2) diagnose the top execution, 3) compare bad vs normal if needed, 4) for resmgr:cpu quantum, review CPU pressure and PX pressure ratios to see whether parallel overlap likely drove throttling.'
+from dual;
+
+prompt =========================================================================
+prompt END OF WAIT EVENT ROOTCAUSE V2
+prompt =========================================================================
+
+undefine p_from_ts_raw
+undefine p_to_ts_raw
+undefine p_event_filter
+undefine p_top_n
