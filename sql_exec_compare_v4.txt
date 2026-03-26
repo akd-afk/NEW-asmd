@@ -1,0 +1,267 @@
+-- =============================================================================
+-- File: sql_exec_compare_v4.txt
+-- Purpose:
+--   Compare one NORMAL execution and one BAD execution of the same SQL_ID.
+--   This is the gap that the internal tool appears to miss most often.
+--
+-- Usage:
+--   @sql_exec_compare_v4.txt <sql_id> <good_exec_start_ts> <good_exec_id> <bad_exec_start_ts> <bad_exec_id>
+--
+-- Example:
+--   @sql_exec_compare_v4.txt 6vp79a53hkmh8 2026-03-25_02:01:43 16802827 2026-03-25_02:01:46 33596436
+--
+-- Timestamp format:
+--   YYYY-MM-DD_HH24:MI:SS
+-- =============================================================================
+
+define p_sql_id       = '&&1'
+define p_good_exec_ts = '&&2'
+define p_good_exec_id = '&&3'
+define p_bad_exec_ts  = '&&4'
+define p_bad_exec_id  = '&&5'
+
+set pages 500
+set lines 360
+set trimspool on
+set verify off
+set feedback on
+set echo off
+set tab off
+
+col execution_role      format a6
+col wait_class          format a18
+col event               format a45 word_wrapped
+col owner               format a20
+col object_name         format a36
+col plan_line           format a110
+col diagnosis           format a140 word_wrapped
+
+col plan_hash_value     format 999999999999999
+col sample_cnt          format 999999
+col good_secs           format 999999999
+col bad_secs            format 999999999
+col delta_secs          format 999999999
+col good_pct            format 990.99
+col bad_pct             format 990.99
+
+prompt =========================================================================
+prompt SQL EXEC COMPARE V4
+prompt =========================================================================
+prompt SQL_ID        : &&p_sql_id
+prompt GOOD_EXEC_TS  : &&p_good_exec_ts
+prompt GOOD_EXEC_ID  : &&p_good_exec_id
+prompt BAD_EXEC_TS   : &&p_bad_exec_ts
+prompt BAD_EXEC_ID   : &&p_bad_exec_id
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - CORE EXECUTION METRICS
+prompt =========================================================================
+
+with execs as (
+    select 'GOOD' as execution_role,
+           *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_good_exec_id')
+      and sql_exec_start = to_date(replace('&&p_good_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+    union all
+    select 'BAD',
+           *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_bad_exec_id')
+      and sql_exec_start = to_date(replace('&&p_bad_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+)
+select execution_role,
+       max(sql_plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value,
+       count(*) as sample_cnt,
+       count(*) * 10 as sampled_secs,
+       sum(case when session_state='WAITING' then 1 else 0 end) * 10 as wait_secs,
+       sum(case when session_state='ON CPU'  then 1 else 0 end) * 10 as cpu_secs,
+       sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+       sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs
+from execs
+group by execution_role
+order by execution_role;
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - WAIT PROFILE DELTA
+prompt =========================================================================
+
+with good_exec as (
+    select nvl(wait_class,'ON CPU') as wait_class,
+           nvl(event,'ON CPU') as event,
+           count(*) * 10 as good_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_good_exec_id')
+      and sql_exec_start = to_date(replace('&&p_good_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+    group by nvl(wait_class,'ON CPU'), nvl(event,'ON CPU')
+),
+bad_exec as (
+    select nvl(wait_class,'ON CPU') as wait_class,
+           nvl(event,'ON CPU') as event,
+           count(*) * 10 as bad_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_bad_exec_id')
+      and sql_exec_start = to_date(replace('&&p_bad_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+    group by nvl(wait_class,'ON CPU'), nvl(event,'ON CPU')
+)
+select *
+from (
+    select nvl(g.wait_class, b.wait_class) as wait_class,
+           nvl(g.event, b.event) as event,
+           nvl(g.good_secs, 0) as good_secs,
+           nvl(b.bad_secs, 0) as bad_secs,
+           nvl(b.bad_secs,0) - nvl(g.good_secs,0) as delta_secs
+    from good_exec g
+    full outer join bad_exec b
+      on g.wait_class = b.wait_class
+     and g.event = b.event
+    order by abs(nvl(b.bad_secs,0) - nvl(g.good_secs,0)) desc, event
+)
+where rownum <= 15;
+
+prompt
+prompt =========================================================================
+prompt SECTION 3 - TOP OBJECT DELTA
+prompt =========================================================================
+
+with good_obj as (
+    select current_obj#, count(*) * 10 as good_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_good_exec_id')
+      and sql_exec_start = to_date(replace('&&p_good_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+      and current_obj# is not null
+      and current_obj# <> -1
+    group by current_obj#
+),
+bad_obj as (
+    select current_obj#, count(*) * 10 as bad_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_bad_exec_id')
+      and sql_exec_start = to_date(replace('&&p_bad_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+      and current_obj# is not null
+      and current_obj# <> -1
+    group by current_obj#
+)
+select *
+from (
+    select nvl(og.owner, ob.owner) as owner,
+           nvl(og.object_name, ob.object_name) as object_name,
+           nvl(g.good_secs, 0) as good_secs,
+           nvl(b.bad_secs, 0) as bad_secs,
+           nvl(b.bad_secs,0) - nvl(g.good_secs,0) as delta_secs
+    from good_obj g
+    full outer join bad_obj b
+      on g.current_obj# = b.current_obj#
+    left join dba_objects og
+      on og.object_id = g.current_obj#
+    left join dba_objects ob
+      on ob.object_id = b.current_obj#
+    order by abs(nvl(b.bad_secs,0) - nvl(g.good_secs,0)) desc, owner, object_name
+)
+where rownum <= 15;
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - PLAN LINE DELTA
+prompt =========================================================================
+
+with good_line as (
+    select sql_plan_hash_value,
+           nvl(sql_plan_line_id,-1) as sql_plan_line_id,
+           count(*) * 10 as good_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_good_exec_id')
+      and sql_exec_start = to_date(replace('&&p_good_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+    group by sql_plan_hash_value, nvl(sql_plan_line_id,-1)
+),
+bad_line as (
+    select sql_plan_hash_value,
+           nvl(sql_plan_line_id,-1) as sql_plan_line_id,
+           count(*) * 10 as bad_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_bad_exec_id')
+      and sql_exec_start = to_date(replace('&&p_bad_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+    group by sql_plan_hash_value, nvl(sql_plan_line_id,-1)
+)
+select *
+from (
+    select nvl(g.sql_plan_hash_value, b.sql_plan_hash_value) as plan_hash_value,
+           nvl(g.sql_plan_line_id, b.sql_plan_line_id) as sql_plan_line_id,
+           nvl(pg.operation, pb.operation) as operation,
+           nvl(pg.options, pb.options) as options,
+           nvl(g.good_secs, 0) as good_secs,
+           nvl(b.bad_secs, 0) as bad_secs,
+           nvl(b.bad_secs,0) - nvl(g.good_secs,0) as delta_secs
+    from good_line g
+    full outer join bad_line b
+      on g.sql_plan_hash_value = b.sql_plan_hash_value
+     and g.sql_plan_line_id = b.sql_plan_line_id
+    left join dba_hist_sql_plan pg
+      on pg.sql_id = trim('&&p_sql_id')
+     and pg.plan_hash_value = g.sql_plan_hash_value
+     and pg.id = g.sql_plan_line_id
+    left join dba_hist_sql_plan pb
+      on pb.sql_id = trim('&&p_sql_id')
+     and pb.plan_hash_value = b.sql_plan_hash_value
+     and pb.id = b.sql_plan_line_id
+    order by abs(nvl(b.bad_secs,0) - nvl(g.good_secs,0)) desc, sql_plan_line_id
+)
+where rownum <= 15;
+
+prompt
+prompt =========================================================================
+prompt SECTION 5 - SYNTHESIS
+prompt =========================================================================
+
+with g as (
+    select max(sql_plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value,
+           count(*) * 10 as sampled_secs,
+           sum(case when session_state='WAITING' then 1 else 0 end) * 10 as wait_secs,
+           sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+           sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_good_exec_id')
+      and sql_exec_start = to_date(replace('&&p_good_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+),
+b as (
+    select max(sql_plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value,
+           count(*) * 10 as sampled_secs,
+           sum(case when session_state='WAITING' then 1 else 0 end) * 10 as wait_secs,
+           sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+           sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_bad_exec_id')
+      and sql_exec_start = to_date(replace('&&p_bad_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+)
+select
+    case
+        when b.plan_hash_value <> g.plan_hash_value then 'Plan changed between normal and bad execution.'
+        when b.blocked_secs > g.blocked_secs then 'Bad execution shows stronger blocking signal than normal.'
+        when b.px_secs > g.px_secs then 'Bad execution shows stronger PX signal than normal.'
+        when b.wait_secs > g.wait_secs then 'Bad execution is more wait-heavy than normal.'
+        else 'Bad execution differs from normal, but no single delta dominates.'
+    end as diagnosis
+from g cross join b;
+
+prompt =========================================================================
+prompt END OF COMPARE V4
+prompt =========================================================================
+
+undefine p_sql_id
+undefine p_good_exec_ts
+undefine p_good_exec_id
+undefine p_bad_exec_ts
+undefine p_bad_exec_id

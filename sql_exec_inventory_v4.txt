@@ -1,0 +1,270 @@
+-- =============================================================================
+-- File: sql_exec_inventory_v4.txt
+-- Purpose:
+--   Execution-centric inventory for one SQL_ID in a historical window.
+--   This script is the front door. It finds and ranks individual executions,
+--   highlights outliers, and prints an exact diagnose command for each run.
+--
+-- Usage:
+--   @sql_exec_inventory_v4.txt <sql_id> <from_ts> <to_ts>
+--
+-- Example:
+--   @sql_exec_inventory_v4.txt 6vp79a53hkmh8 2026-03-25_01:58 2026-03-25_02:04
+--
+-- Timestamp format:
+--   YYYY-MM-DD_HH24:MI
+--
+-- Notes:
+--   - Execution identity is SQL_EXEC_ID + SQL_EXEC_START
+--   - Based on DBA_HIST_ACTIVE_SESS_HISTORY sampling
+--   - Very short executions may be under-sampled or missed
+-- =============================================================================
+
+define p_sql_id      = '&&1'
+define p_from_ts_raw = '&&2'
+define p_to_ts_raw   = '&&3'
+define p_top_n       = '30'
+
+set pages 500
+set lines 360
+set trimspool on
+set verify off
+set feedback on
+set echo off
+set tab off
+set serveroutput off
+
+col sql_id               format a15
+col begin_time           format a19
+col end_time             format a19
+col exec_start           format a19
+col first_seen           format a19
+col last_seen            format a19
+col module               format a22 trunc
+col action               format a34 trunc
+col machine              format a30 trunc
+col program              format a32 trunc
+col generated_command    format a120 word_wrapped
+col diagnosis_hint       format a24
+col cadence_comment      format a80 word_wrapped
+
+col rank_no              format 999
+col instance_number      format 99999
+col session_id           format 999999
+col session_serial#      format 999999
+col sql_exec_id          format 999999999999
+col plan_hash_value      format 999999999999999
+col plan_popularity      format 999999
+col sample_cnt           format 999999
+col sampled_secs         format 999999999
+col wait_secs            format 999999999
+col cpu_secs             format 999999999
+col blocked_secs         format 999999999
+col px_secs              format 999999999
+col approx_elapsed_s     format 999999999.999
+col wait_ratio_pct       format 990.99
+col score                format 9999990.99
+col gap_seconds          format 999999990.999
+
+prompt =========================================================================
+prompt SQL EXEC INVENTORY V4
+prompt =========================================================================
+prompt SQL_ID  : &&p_sql_id
+prompt FROM_TS : &&p_from_ts_raw
+prompt TO_TS   : &&p_to_ts_raw
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - WINDOW SANITY
+prompt =========================================================================
+
+with p as (
+    select trim('&&p_sql_id') as sql_id,
+           to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI') as from_ts,
+           to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI') as to_ts
+    from dual
+)
+select sql_id,
+       to_char(from_ts, 'YYYY-MM-DD HH24:MI:SS') as begin_time,
+       to_char(to_ts  , 'YYYY-MM-DD HH24:MI:SS') as end_time,
+       round((to_ts - from_ts) * 24 * 60, 1) as window_minutes
+from p;
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - EXECUTION INVENTORY / RANKING
+prompt =========================================================================
+
+with ash_base as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and sql_exec_id is not null
+      and sql_exec_start is not null
+),
+exec_agg as (
+    select instance_number,
+           session_id,
+           session_serial#,
+           sql_exec_id,
+           sql_exec_start,
+           min(sample_time) as first_seen,
+           max(sample_time) as last_seen,
+           max(sql_plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value,
+           max(module) keep (dense_rank last order by sample_time) as module,
+           max(action) keep (dense_rank last order by sample_time) as action,
+           max(machine) keep (dense_rank last order by sample_time) as machine,
+           max(program) keep (dense_rank last order by sample_time) as program,
+           count(*) as sample_cnt,
+           count(*) * 10 as sampled_secs,
+           sum(case when session_state = 'WAITING' then 1 else 0 end) * 10 as wait_secs,
+           sum(case when session_state = 'ON CPU'  then 1 else 0 end) * 10 as cpu_secs,
+           sum(case when blocking_session is not null then 1 else 0 end) * 10 as blocked_secs,
+           sum(case when qc_session_id is not null then 1 else 0 end) * 10 as px_secs,
+           round((cast(max(sample_time) as date) - cast(min(sample_time) as date)) * 86400, 3) as approx_elapsed_s
+    from ash_base
+    group by instance_number, session_id, session_serial#, sql_exec_id, sql_exec_start
+),
+plan_pop as (
+    select plan_hash_value, count(*) as plan_popularity
+    from exec_agg
+    group by plan_hash_value
+),
+scored as (
+    select e.*,
+           nvl(p.plan_popularity,0) as plan_popularity,
+           round(case when e.sampled_secs > 0 then (e.wait_secs * 100 / e.sampled_secs) else 0 end, 2) as wait_ratio_pct,
+           round(
+               (e.sampled_secs / 10)
+             + (case when e.sampled_secs > 0 then (e.wait_secs * 30 / e.sampled_secs) else 0 end)
+             + (case when e.blocked_secs > 0 then 35 else 0 end)
+             + (case when e.px_secs > 0 then 10 else 0 end)
+             + (case when nvl(p.plan_popularity,0) <= 1 then 15
+                     when nvl(p.plan_popularity,0) <= 3 then 7
+                     else 0 end)
+           , 2) as score
+    from exec_agg e
+    left join plan_pop p
+      on p.plan_hash_value = e.plan_hash_value
+),
+ranked as (
+    select row_number() over (order by score desc, sampled_secs desc, wait_secs desc, first_seen) as rank_no,
+           s.*
+    from scored s
+)
+select *
+from (
+    select rank_no,
+           instance_number,
+           session_id,
+           session_serial#,
+           sql_exec_id,
+           to_char(sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') as exec_start,
+           to_char(first_seen    , 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+           to_char(last_seen     , 'YYYY-MM-DD HH24:MI:SS') as last_seen,
+           plan_hash_value,
+           plan_popularity,
+           sampled_secs,
+           approx_elapsed_s,
+           wait_secs,
+           cpu_secs,
+           blocked_secs,
+           px_secs,
+           wait_ratio_pct,
+           score,
+           module,
+           action,
+           machine,
+           program,
+           case
+               when blocked_secs > 0 then 'BLOCKING_SIGNAL'
+               when px_secs > 0 and wait_secs > cpu_secs then 'PX_OR_CLUSTER_SIGNAL'
+               when wait_ratio_pct >= 80 then 'WAIT_HEAVY'
+               when plan_popularity <= 1 then 'RARE_PLAN'
+               else 'GENERAL_OUTLIER'
+           end as diagnosis_hint,
+           '@sql_exec_diagnose_v4.txt '||trim('&&p_sql_id')||' '||
+           to_char(sql_exec_start, 'YYYY-MM-DD_HH24:MI:SS')||' '||
+           sql_exec_id as generated_command
+    from ranked
+    order by rank_no
+)
+where rownum <= to_number('&&p_top_n');
+
+prompt
+prompt =========================================================================
+prompt SECTION 3 - CADENCE / EXECUTION SPACING
+prompt =========================================================================
+
+with execs as (
+    select min(sample_time) as first_seen
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and sql_exec_id is not null
+      and sql_exec_start is not null
+    group by instance_number, session_id, session_serial#, sql_exec_id, sql_exec_start
+),
+ordered_execs as (
+    select first_seen,
+           lag(first_seen) over(order by first_seen) as prev_first_seen
+    from execs
+),
+gaps as (
+    select first_seen,
+           round((cast(first_seen as date) - cast(prev_first_seen as date)) * 86400, 3) as gap_seconds
+    from ordered_execs
+    where prev_first_seen is not null
+)
+select *
+from (
+    select to_char(first_seen, 'YYYY-MM-DD HH24:MI:SS') as first_seen,
+           gap_seconds,
+           case
+               when gap_seconds is null then 'N/A'
+               when gap_seconds <= 2 then 'BACK_TO_BACK'
+               when gap_seconds <= 15 then 'VERY_FREQUENT'
+               when gap_seconds <= 60 then 'RECURRING'
+               else 'SPREAD_OUT'
+           end as cadence_comment
+    from gaps
+    order by first_seen
+)
+where rownum <= 50;
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - PLAN HASH DISTRIBUTION IN WINDOW
+prompt =========================================================================
+
+with ash_base as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sample_time between to_date(replace('&&p_from_ts_raw','_',' '), 'YYYY-MM-DD HH24:MI')
+                          and to_date(replace('&&p_to_ts_raw'  ,'_',' '), 'YYYY-MM-DD HH24:MI')
+      and sql_exec_id is not null
+      and sql_exec_start is not null
+),
+exec_agg as (
+    select max(sql_plan_hash_value) keep (dense_rank last order by sample_time) as plan_hash_value
+    from ash_base
+    group by instance_number, session_id, session_serial#, sql_exec_id, sql_exec_start
+)
+select plan_hash_value, count(*) as executions
+from exec_agg
+group by plan_hash_value
+order by executions desc, plan_hash_value;
+
+prompt =========================================================================
+prompt END OF INVENTORY V4
+prompt =========================================================================
+
+undefine p_sql_id
+undefine p_from_ts_raw
+undefine p_to_ts_raw
+undefine p_top_n

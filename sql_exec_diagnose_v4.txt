@@ -1,0 +1,429 @@
+-- =============================================================================
+-- File: sql_exec_diagnose_v4.txt
+-- Purpose:
+--   Deep diagnosis for ONE chosen execution.
+--   This is the execution-centric RCA engine that complements the internal tool.
+--
+-- Usage:
+--   @sql_exec_diagnose_v4.txt <sql_id> <exec_start_ts> <exec_id>
+--
+-- Example:
+--   @sql_exec_diagnose_v4.txt 6vp79a53hkmh8 2026-03-25_02:01:46 33596436
+--
+-- Timestamp format:
+--   YYYY-MM-DD_HH24:MI:SS
+--
+-- Notes:
+--   - All facts are scoped to one exact execution
+--   - Statements about blocking / PX / temp / undo mean "observed in sampled ASH"
+-- =============================================================================
+
+define p_sql_id  = '&&1'
+define p_exec_ts = '&&2'
+define p_exec_id = '&&3'
+
+set pages 500
+set lines 360
+set trimspool on
+set verify off
+set feedback on
+set echo off
+set tab off
+set serveroutput off
+
+col section              format a28
+col value                format a130 word_wrapped
+col wait_class           format a18
+col event                format a45 word_wrapped
+col owner                format a20
+col object_name          format a36
+col subobject_name       format a24
+col object_type          format a18
+col operation            format a28
+col options              format a24
+col plan_line            format a110
+col diagnosis            format a140 word_wrapped
+col next_steps           format a140 word_wrapped
+col confidence           format a12
+col limitation           format a140 word_wrapped
+
+col instance_number      format 99999
+col session_id           format 999999
+col session_serial#      format 999999
+col sql_exec_id          format 999999999999
+col plan_hash_value      format 999999999999999
+col sample_cnt           format 999999
+col sampled_secs         format 999999999
+col sampled_pct          format 990.99
+col pga_mb               format 9999990.99
+col plan_count           format 999999
+col execs                format 999999999
+col avg_ela_ms_exec      format 9999999990.99
+col avg_cpu_ms_exec      format 9999999990.99
+col avg_lio_exec         format 9999999990.99
+col avg_pio_exec         format 9999999990.99
+
+prompt =========================================================================
+prompt SQL EXEC DIAGNOSE V4
+prompt =========================================================================
+prompt SQL_ID    : &&p_sql_id
+prompt EXEC_TS   : &&p_exec_ts
+prompt EXEC_ID   : &&p_exec_id
+prompt =========================================================================
+
+prompt
+prompt =========================================================================
+prompt SECTION 1 - EXECUTION HEADER
+prompt =========================================================================
+
+with ash_exec as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+)
+select 'SQL_ID' as section, trim('&&p_sql_id') as value from dual
+union all
+select 'EXECUTION_START', trim('&&p_exec_ts') from dual
+union all
+select 'EXECUTION_ID', trim('&&p_exec_id') from dual
+union all
+select 'SESSION@INSTANCE',
+       to_char(max(session_id))||','||to_char(max(session_serial#))||'@'||to_char(max(instance_number))
+from ash_exec
+union all
+select 'PLAN_HASH_VALUE',
+       to_char(max(sql_plan_hash_value) keep (dense_rank last order by sample_time))
+from ash_exec
+union all
+select 'EXECUTING_USER',
+       max(user_id) keep (dense_rank last order by sample_time)
+from ash_exec
+union all
+select 'MODULE',
+       max(module) keep (dense_rank last order by sample_time)
+from ash_exec
+union all
+select 'ACTION',
+       max(action) keep (dense_rank last order by sample_time)
+from ash_exec
+union all
+select 'MACHINE',
+       max(machine) keep (dense_rank last order by sample_time)
+from ash_exec
+union all
+select 'PROGRAM',
+       max(program) keep (dense_rank last order by sample_time)
+from ash_exec;
+
+prompt
+prompt =========================================================================
+prompt SECTION 2 - EXECUTION EVIDENCE / CORE SIGNALS
+prompt =========================================================================
+
+with ash_exec as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+)
+select 'ASH_SAMPLE_COUNT' as section, to_char(count(*)) as value from ash_exec
+union all
+select 'SAMPLED_SECONDS', to_char(count(*) * 10) from ash_exec
+union all
+select 'WAIT_SECONDS', to_char(sum(case when session_state='WAITING' then 1 else 0 end) * 10) from ash_exec
+union all
+select 'CPU_SECONDS', to_char(sum(case when session_state='ON CPU' then 1 else 0 end) * 10) from ash_exec
+union all
+select 'BLOCKING_SEEN_IN_SAMPLED_ASH',
+       case when max(case when blocking_session is not null then 1 else 0 end) = 1 then 'YES' else 'NO' end
+from ash_exec
+union all
+select 'PX_SEEN_IN_SAMPLED_ASH',
+       case when max(case when qc_session_id is not null then 1 else 0 end) = 1 then 'YES' else 'NO' end
+from ash_exec
+union all
+select 'UNDO_TABLESPACE_READ_SEEN',
+       case when max(case when event like 'undo%' or event like '%undo%' then 1 else 0 end) = 1 then 'YES' else 'NO' end
+from ash_exec
+union all
+select 'TEMP_USAGE_SEEN_IN_SAMPLED_ASH',
+       case when max(case when temp_space_allocated > 0 then 1 else 0 end) = 1 then 'YES' else 'NO' end
+from ash_exec
+union all
+select 'ESTIMATED_MAX_PGA_MB',
+       to_char(round(max(pga_allocated) / 1024 / 1024, 2))
+from ash_exec;
+
+prompt
+prompt =========================================================================
+prompt SECTION 3 - WAIT PROFILE
+prompt =========================================================================
+
+with ash_exec as (
+    select nvl(wait_class, 'ON CPU') as wait_class,
+           nvl(event, 'ON CPU') as event
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+),
+agg as (
+    select wait_class, event, count(*) as sample_cnt
+    from ash_exec
+    group by wait_class, event
+),
+tot as (
+    select sum(sample_cnt) as total_samples from agg
+)
+select wait_class,
+       event,
+       sample_cnt,
+       sample_cnt * 10 as sampled_secs,
+       round(sample_cnt * 100 / nullif((select total_samples from tot),0), 2) as sampled_pct
+from agg
+order by sample_cnt desc, wait_class, event;
+
+prompt
+prompt =========================================================================
+prompt SECTION 4 - TOP OBJECTS IN THIS EXECUTION
+prompt =========================================================================
+
+with ash_exec as (
+    select current_obj#
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+      and current_obj# is not null
+      and current_obj# <> -1
+),
+agg as (
+    select current_obj#, count(*) as sample_cnt
+    from ash_exec
+    group by current_obj#
+),
+tot as (
+    select sum(sample_cnt) as total_samples from agg
+)
+select nvl(o.owner,'<unknown>') as owner,
+       nvl(o.object_name,'<unknown>') as object_name,
+       nvl(o.subobject_name,'<none>') as subobject_name,
+       nvl(o.object_type,'<unknown>') as object_type,
+       a.sample_cnt,
+       a.sample_cnt * 10 as sampled_secs,
+       round(a.sample_cnt * 100 / nullif((select total_samples from tot),0), 2) as sampled_pct
+from agg a
+left join dba_objects o
+  on o.object_id = a.current_obj#
+order by a.sample_cnt desc, owner, object_name;
+
+prompt
+prompt =========================================================================
+prompt SECTION 5 - PLAN LINE / OPERATION HOTSPOTS
+prompt =========================================================================
+
+with ash_exec as (
+    select sql_plan_hash_value,
+           nvl(sql_plan_line_id, -1) as sql_plan_line_id,
+           count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+    group by sql_plan_hash_value, nvl(sql_plan_line_id, -1)
+),
+tot as (
+    select sum(sample_cnt) as total_samples from ash_exec
+)
+select a.sql_plan_hash_value as plan_hash_value,
+       a.sql_plan_line_id,
+       p.operation,
+       p.options,
+       lpad(' ', p.depth, ' ') || p.operation || ' ' || p.options ||
+       nvl2(p.object_name, ' ['||p.object_name||']', null) as plan_line,
+       a.sample_cnt,
+       a.sample_cnt * 10 as sampled_secs,
+       round(a.sample_cnt * 100 / nullif((select total_samples from tot),0), 2) as sampled_pct
+from ash_exec a
+left join dba_hist_sql_plan p
+  on p.sql_id = trim('&&p_sql_id')
+ and p.plan_hash_value = a.sql_plan_hash_value
+ and p.id = a.sql_plan_line_id
+order by a.sample_cnt desc, a.sql_plan_line_id;
+
+prompt
+prompt =========================================================================
+prompt SECTION 6 - HISTORICAL PLAN CONTEXT
+prompt =========================================================================
+
+with hist as (
+    select plan_hash_value,
+           sum(nvl(executions_delta,0)) as execs,
+           round(sum(nvl(elapsed_time_delta,0)) / nullif(sum(nvl(executions_delta,0)),0) / 1000, 2) as avg_ela_ms_exec,
+           round(sum(nvl(cpu_time_delta,0))     / nullif(sum(nvl(executions_delta,0)),0) / 1000, 2) as avg_cpu_ms_exec,
+           round(sum(nvl(buffer_gets_delta,0))  / nullif(sum(nvl(executions_delta,0)),0), 2) as avg_lio_exec,
+           round(sum(nvl(disk_reads_delta,0))   / nullif(sum(nvl(executions_delta,0)),0), 2) as avg_pio_exec
+    from dba_hist_sqlstat
+    where sql_id = trim('&&p_sql_id')
+    group by plan_hash_value
+)
+select plan_hash_value,
+       execs,
+       avg_ela_ms_exec,
+       avg_cpu_ms_exec,
+       avg_lio_exec,
+       avg_pio_exec
+from hist
+order by execs desc, avg_ela_ms_exec desc nulls last;
+
+prompt
+prompt =========================================================================
+prompt SECTION 7 - STATS / METADATA CONTEXT FOR TOP OBJECTS
+prompt =========================================================================
+
+with top_objs as (
+    select current_obj#, count(*) as sample_cnt
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+      and current_obj# is not null
+      and current_obj# <> -1
+    group by current_obj#
+),
+resolved as (
+    select o.owner,
+           o.object_name,
+           o.subobject_name,
+           o.object_type,
+           t.sample_cnt
+    from top_objs t
+    join dba_objects o
+      on o.object_id = t.current_obj#
+),
+top5 as (
+    select *
+    from (
+        select r.*,
+               row_number() over(order by r.sample_cnt desc, r.owner, r.object_name) as rn
+        from resolved r
+    )
+    where rn <= 5
+)
+select t.owner,
+       t.object_name,
+       t.object_type,
+       s.table_name,
+       to_char(s.last_analyzed, 'YYYY-MM-DD HH24:MI:SS') as last_analyzed,
+       s.num_rows,
+       s.blocks,
+       s.stale_stats
+from top5 t
+left join dba_tab_statistics s
+  on s.owner = t.owner
+ and s.table_name = t.object_name
+ and s.partition_name is null
+order by t.sample_cnt desc, t.owner, t.object_name;
+
+prompt
+prompt =========================================================================
+prompt SECTION 8 - INTERPRETED FINDINGS
+prompt =========================================================================
+
+with ash_exec as (
+    select *
+    from dba_hist_active_sess_history
+    where sql_id = trim('&&p_sql_id')
+      and sql_exec_id = to_number('&&p_exec_id')
+      and sql_exec_start = to_date(replace('&&p_exec_ts','_',' '), 'YYYY-MM-DD HH24:MI:SS')
+),
+wait_agg as (
+    select nvl(wait_class,'ON CPU') as wait_class,
+           nvl(event,'ON CPU') as event,
+           count(*) as sample_cnt
+    from ash_exec
+    group by nvl(wait_class,'ON CPU'), nvl(event,'ON CPU')
+),
+top_wait as (
+    select *
+    from (
+        select w.*,
+               row_number() over(order by sample_cnt desc, wait_class, event) as rn
+        from wait_agg w
+    )
+    where rn = 1
+),
+obj_agg as (
+    select current_obj#, count(*) as sample_cnt
+    from ash_exec
+    where current_obj# is not null
+      and current_obj# <> -1
+    group by current_obj#
+),
+top_obj as (
+    select owner, object_name, object_type, sample_cnt
+    from (
+        select o.owner, o.object_name, o.object_type, a.sample_cnt,
+               row_number() over(order by a.sample_cnt desc, o.owner, o.object_name) as rn
+        from obj_agg a
+        left join dba_objects o
+          on o.object_id = a.current_obj#
+    )
+    where rn = 1
+),
+plan_counts as (
+    select count(distinct plan_hash_value) as plan_count
+    from dba_hist_sqlstat
+    where sql_id = trim('&&p_sql_id')
+)
+select 'OBSERVED_FACTS' as section,
+       'Top wait class/event = '||
+       (select wait_class||' / '||event from top_wait)||
+       '; top object = '||
+       nvl((select owner||'.'||object_name from top_obj), '<not resolved>')||
+       '; historical plan count = '||
+       to_char((select plan_count from plan_counts)) as value
+from dual
+union all
+select 'LIKELY_INTERPRETATION',
+       case
+           when (select wait_class from top_wait) = 'Cluster' then
+               'This execution is cluster-wait dominated in sampled ASH. Treat RAC-side contention as a primary suspect before blaming PX or temp.'
+           when (select wait_class from top_wait) = 'Concurrency' then
+               'This execution is concurrency dominated in sampled ASH. Treat blocking / enqueue / latch style contention as a primary suspect.'
+           when (select wait_class from top_wait) = 'User I/O' then
+               'This execution is user-I/O dominated in sampled ASH. Treat access path / hot object / storage latency as primary suspects.'
+           when (select wait_class from top_wait) = 'ON CPU' then
+               'This execution is CPU dominant in sampled ASH. Treat row-source work, cardinality error, or inefficient plan shape as primary suspects.'
+           else
+               'This execution has a mixed profile. Use wait, object, and plan-line evidence together before concluding root cause.'
+       end
+from dual
+union all
+select 'CONFIDENCE',
+       case
+           when (select wait_class from top_wait) in ('Cluster','Concurrency','User I/O') then 'MEDIUM'
+           when (select wait_class from top_wait) = 'ON CPU' then 'MEDIUM'
+           else 'LOW_TO_MEDIUM'
+       end
+from dual
+union all
+select 'LIMITATIONS',
+       'ASH is sampled. Short-lived blockers, very short plan steps, or very short executions can be under-sampled or missed.'
+from dual
+union all
+select 'NEXT_ACTIONS',
+       '@sql_exec_compare_v4.txt '||trim('&&p_sql_id')||' <good_exec_start_ts> <good_exec_id> '||
+       trim('&&p_exec_ts')||' '||trim('&&p_exec_id')
+from dual;
+
+prompt =========================================================================
+prompt END OF DIAGNOSE V4
+prompt =========================================================================
+
+undefine p_sql_id
+undefine p_exec_ts
+undefine p_exec_id
