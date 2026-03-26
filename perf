@@ -1,0 +1,245 @@
+=============================================================================
+-- File: sql_exec_triage_v3.sql
+-- Purpose: Incident-first triage for a SQL_ID with summary block, cadence analyzer,
+--          and generated handoff commands.
+-- Usage: @sql_exec_triage_v3.sql <sql_id> <from_ts> <to_ts>
+-- =============================================================================
+define p_sql_id='&&1'
+define p_from_ts_raw='&&2'
+define p_to_ts_raw='&&3'
+define p_top_n='10'
+set pages 500 lines 360 trimspool on verify off feedback on echo off tab off
+col sql_text format a145 word_wrapped
+col exec_start format a19
+col event format a45 word_wrapped
+col wait_class format a18
+col summary_item format a26
+col summary_value format a110 word_wrapped
+col diagnosis_hint format a28
+col clue_header format a46
+col notes format a118 word_wrapped
+col likely_causes format a118 word_wrapped
+col next_step format a128 word_wrapped
+col where_to_check format a128 word_wrapped
+col generated_command format a160 word_wrapped
+
+prompt =========================================================================
+prompt SQL EXEC TRIAGE V3
+prompt =========================================================================
+
+prompt SECTION 1 - WINDOW SANITY / SQL TEXT
+with p as (
+ select trim('&&p_sql_id') sql_id,to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI') from_ts,to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI') to_ts from dual
+)
+select sql_id,to_char(from_ts,'YYYY-MM-DD HH24:MI:SS') begin_time,to_char(to_ts,'YYYY-MM-DD HH24:MI:SS') end_time,round((to_ts-from_ts)*24*60,1) window_minutes from p;
+select sql_id, sql_text from dba_hist_sqltext where sql_id=trim('&&p_sql_id');
+
+prompt SECTION 2 - INCIDENT SUMMARY BLOCK
+with ash_base as (
+ select * from dba_hist_active_sess_history
+ where sql_id=trim('&&p_sql_id')
+ and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                     and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+),
+execs as (
+ select instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start,
+        max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,
+        count(*)*10 sampled_secs,
+        row_number() over(order by count(*) desc) rn
+ from ash_base
+ where sql_exec_start is not null and sql_exec_id is not null
+ group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+),
+top_wait as (
+ select * from (
+   select nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 secs,row_number() over(order by count(*) desc,wait_class,event) rn
+   from ash_base group by nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+ ) where rn=1
+)
+select 'SQL_MATERIALLY_VISIBLE' summary_item, case when (select count(*) from ash_base)>0 then 'YES' else 'NO' end summary_value from dual
+union all
+select 'OUTLIER_EXECUTION_FOUND', case when exists(select 1 from execs where rn=1) then 'YES' else 'NO' end from dual
+union all
+select 'PLAN_INSTABILITY', case when (select count(distinct sql_plan_hash_value) from ash_base)>1 then 'YES' else 'NO' end from dual
+union all
+select 'DOMINANT_WAIT', (select wait_class||' / '||event from top_wait) from dual
+union all
+select 'TOP_EXECUTION', (select 'inst='||instance_number||' sid='||session_id||' serial='||session_serial#||' exec_start='||to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS')||' exec_id='||sql_exec_id||' plan='||plan_hash_value from execs where rn=1) from dual
+union all
+select 'PX_PRESENT', case when (select sum(case when qc_session_id is not null then 1 else 0 end) from ash_base)>0 then 'YES' else 'NO' end from dual
+union all
+select 'BLOCKING_PRESENT', case when (select sum(case when blocking_session is not null then 1 else 0 end) from ash_base)>0 then 'YES' else 'NO' end from dual;
+
+prompt SECTION 3 - START HERE / SIGNAL SCORECARD
+with ash_base as (
+ select * from dba_hist_active_sess_history
+ where sql_id=trim('&&p_sql_id')
+ and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                     and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+),
+top_exec as (
+ select * from (
+   select instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start,count(*)*10 sampled_secs,row_number() over(order by count(*) desc) rn
+   from ash_base where sql_exec_start is not null and sql_exec_id is not null
+   group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+ ) where rn=1
+),
+top_wait as (
+ select * from (
+   select nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 secs,row_number() over(order by count(*) desc,wait_class,event) rn
+   from ash_base group by nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+ ) where rn=1
+),
+agg as (
+ select count(distinct sql_plan_hash_value) plan_hashes,
+        sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+        sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+ from ash_base
+)
+select case
+         when a.blocked_secs>0 then 'VICTIM_OR_CONTENTION_DRIVEN'
+         when a.px_secs>0 and tw.wait_class='Cluster' then 'PX_RAC_AMPLIFIED'
+         when tw.wait_class='User I/O' then 'ACCESS_PATH_OR_OBJECT_DRIVEN'
+         when tw.wait_class='Concurrency' then 'CONTENTION_DRIVEN'
+         when a.plan_hashes>1 then 'PLAN_INSTABILITY'
+         else 'EXECUTION_SPECIFIC_REVIEW_NEEDED'
+       end diagnosis_hint,
+       case
+         when a.blocked_secs>0 then 'Blocking is present'
+         when a.px_secs>0 and tw.wait_class='Cluster' then 'PX plus Cluster pattern is present'
+         when tw.wait_class='User I/O' then 'User I/O dominates'
+         when tw.wait_class='Concurrency' then 'Concurrency dominates'
+         when a.plan_hashes>1 then 'Multiple plans are present'
+         else 'No single broad signal dominates'
+       end clue_header,
+       'Top sampled wait is '||tw.wait_class||' / '||tw.event||'.' notes,
+       case
+         when a.blocked_secs>0 then 'Victim SQL symptom; blocker/enqueue issue.'
+         when a.px_secs>0 and tw.wait_class='Cluster' then 'PX skew; RAC block movement; cross-instance amplification.'
+         when tw.wait_class='User I/O' then 'Bad access path; hot object; scan shape issue.'
+         when tw.wait_class='Concurrency' then 'Lock/latch/mutex/buffer contention.'
+         when a.plan_hashes>1 then 'Plan regression / bind sensitivity / stats-driven instability.'
+         else 'Needs focused execution review.' end likely_causes,
+       case when exists(select 1 from top_exec) then
+         '@sql_exec_forensics_v2.sql '||trim('&&p_sql_id')||' '||
+         (select instance_number||' '||session_id||' '||session_serial#||' '||to_char(sql_exec_start,'YYYY-MM-DD_HH24:MI:SS')||' '||sql_exec_id from top_exec)
+       else 'No sampled execution available for handoff.' end next_step,
+       case
+         when a.blocked_secs>0 then 'Check blocking summary and run forensics on top execution.'
+         when a.px_secs>0 and tw.wait_class='Cluster' then 'Check PX summary and consider wait xray on dominant wait.'
+         when tw.wait_class in ('User I/O','Concurrency') then 'Check top events and run wait xray if needed.'
+         when a.plan_hashes>1 then 'Check AWR per-exec by plan and compare top execution.'
+         else 'Check top execution first.' end where_to_check
+from agg a cross join top_wait tw;
+
+prompt SECTION 4 - GENERATED NEXT COMMANDS
+with ash_base as (
+ select * from dba_hist_active_sess_history
+ where sql_id=trim('&&p_sql_id')
+ and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                     and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+),
+top_exec as (
+ select * from (
+   select instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start,row_number() over(order by count(*) desc) rn
+   from ash_base where sql_exec_start is not null and sql_exec_id is not null
+   group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+ ) where rn=1
+),
+top_wait as (
+ select * from (
+   select nvl(event,'ON CPU') event,row_number() over(order by count(*) desc,event) rn
+   from ash_base group by nvl(event,'ON CPU')
+ ) where rn=1
+)
+select '@sql_exec_forensics_v2.sql '||trim('&&p_sql_id')||' '||instance_number||' '||session_id||' '||session_serial#||' '||to_char(sql_exec_start,'YYYY-MM-DD_HH24:MI:SS')||' '||sql_exec_id generated_command from top_exec
+union all
+select '@sql_wait_forensics_xray_v2.sql '||trim('&&p_sql_id')||' '||trim('&&p_from_ts_raw')||' '||trim('&&p_to_ts_raw')||' "'||event||'"' from top_wait;
+
+prompt SECTION 5 - TOP EXECUTIONS
+with ash_base as (
+ select * from dba_hist_active_sess_history
+ where sql_id=trim('&&p_sql_id')
+ and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                     and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+ and sql_exec_start is not null and sql_exec_id is not null
+)
+select * from (
+ select row_number() over(order by count(*) desc,sum(case when session_state='WAITING' then 1 else 0 end) desc) score,
+        instance_number,session_id,session_serial#,sql_exec_id,to_char(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') exec_start,
+        max(sql_plan_hash_value) keep (dense_rank last order by sample_time) plan_hash_value,
+        count(*)*10 sampled_secs,
+        sum(case when session_state='WAITING' then 1 else 0 end)*10 wait_secs,
+        sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+        sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+ from ash_base
+ group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+) where rownum<=&&p_top_n;
+
+prompt SECTION 6 - TOP EVENTS
+select * from (
+ select nvl(wait_class,'ON CPU') wait_class,nvl(event,'ON CPU') event,count(*)*10 sampled_secs,round(ratio_to_report(count(*)) over ()*100,2) pct_of_total
+ from dba_hist_active_sess_history
+ where sql_id=trim('&&p_sql_id')
+ and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                     and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+ group by nvl(wait_class,'ON CPU'),nvl(event,'ON CPU')
+ order by sampled_secs desc,wait_class,event
+) where rownum<=&&p_top_n;
+
+prompt SECTION 7 - PX / BLOCKING / INSTANCE SIGNAL
+select instance_number,count(*)*10 sampled_secs,
+       sum(case when blocking_session is not null then 1 else 0 end)*10 blocked_secs,
+       sum(case when qc_session_id is not null then 1 else 0 end)*10 px_secs
+from dba_hist_active_sess_history
+where sql_id=trim('&&p_sql_id')
+and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                    and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+group by instance_number
+order by sampled_secs desc,instance_number;
+
+prompt SECTION 8 - CADENCE ANALYZER
+with execs as (
+ select min(sample_time) first_sample
+ from dba_hist_active_sess_history
+ where sql_id=trim('&&p_sql_id')
+ and sample_time between to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+                     and to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI')
+ and sql_exec_start is not null and sql_exec_id is not null
+ group by instance_number,session_id,session_serial#,sql_exec_id,sql_exec_start
+),
+ordered_execs as (
+ select first_sample,lag(first_sample) over(order by first_sample) prev_first_sample from execs
+)
+select to_char(first_sample,'YYYY-MM-DD HH24:MI:SS') sample_time,
+       round((cast(first_sample as date)-cast(prev_first_sample as date))*86400,1) gap_seconds
+from ordered_execs
+order by first_sample;
+
+prompt SECTION 9 - AWR PER-EXEC VIEW BY PLAN HASH VALUE
+with p as (
+ select to_date(replace('&&p_from_ts_raw','_',' '),'YYYY-MM-DD HH24:MI') from_ts,to_date(replace('&&p_to_ts_raw','_',' '),'YYYY-MM-DD HH24:MI') to_ts from dual
+),
+snaps as (
+ select s.dbid,s.instance_number,s.snap_id
+ from dba_hist_snapshot s,p
+ where s.begin_interval_time<=p.to_ts and s.end_interval_time>=p.from_ts
+)
+select s.plan_hash_value,
+       sum(nvl(s.executions_delta,0)) execs,
+       round(sum(nvl(s.elapsed_time_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0)))/1e3,2) avg_ela_ms_per_exec,
+       round(sum(nvl(s.cpu_time_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0)))/1e3,2) avg_cpu_ms_per_exec,
+       round(sum(nvl(s.buffer_gets_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0))),2) avg_lio_per_exec,
+       round(sum(nvl(s.disk_reads_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0))),2) avg_pio_per_exec,
+       round(sum(nvl(s.rows_processed_delta,0))/decode(sum(nvl(s.executions_delta,0)),0,null,sum(nvl(s.executions_delta,0))),2) avg_rows_per_exec
+from dba_hist_sqlstat s join snaps sn
+ on sn.dbid=s.dbid and sn.instance_number=s.instance_number and sn.snap_id=s.snap_id
+where s.sql_id=trim('&&p_sql_id')
+group by s.plan_hash_value
+order by avg_ela_ms_per_exec desc nulls last,execs desc;
+
+prompt =========================================================================
+prompt USAGE
+prompt =========================================================================
+prompt   @sql_exec_triage_v3.sql <sql_id> <from_ts> <to_ts>
+prompt =========================================================================
