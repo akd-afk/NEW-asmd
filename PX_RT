@@ -1,3 +1,5 @@
+ALTER SYSTEM SET asm_diskstring = 'o/*/DATAC1_*','o/*/RECOC1_*' SCOPE=BOTH SID='*';
+
 #!/usr/bin/env bash
 set -euo pipefail
 
