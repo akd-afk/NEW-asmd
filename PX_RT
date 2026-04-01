@@ -1,4 +1,14 @@
 
+
+
+===
+We reviewed the latest findings with ACS. Their current observation is that the new cells appear healthy, but the existing cells are showing queued requests and elevated disk busy behavior. At this point, ACS does not believe ASM rebalance itself is the main driver. Their concern is that smart scan performance appears to have degraded unexpectedly, and the load is concentrating on the existing cells even after rebalance activity was stopped.
+
+ACS was not yet able to isolate a single clear trigger from the initial review, and they indicated this is serious enough to warrant a Sev 1 escalation. We are moving forward on that basis while continuing point-in-time validation to determine whether the behavior being observed is only current-state health or also aligns with the earlier performance degradation window.
+
+Immediate focus is on confirming where the queuing is occurring, whether the slowdown is tied to smart scan degradation on existing cells, and what additional evidence exists in alert logs and cell-side metrics. We will provide the next update once the Sev 1 is engaged and we have clearer direction on impact and remediation.
+
+==
 From the attached screenshots:
 	•	CPU capacity at cluster level is 96 (48 per node)
 	•	Peak active sessions were around 200, which is about 2x the available CPU (ratio 2.08)
