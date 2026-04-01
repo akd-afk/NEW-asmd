@@ -1,0 +1,660 @@
+SET PAGESIZE 5000
+SET LINESIZE 300
+SET LONG 200000
+SET LONGCHUNKSIZE 200000
+SET TRIMSPOOL ON
+SET TAB OFF
+SET FEEDBACK ON
+SET VERIFY OFF
+SET HEADING ON
+ALTER SESSION SET NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS';
+
+ACCEPT p_sql_id     CHAR PROMPT 'SQL_ID: '
+ACCEPT p_bad_start  CHAR PROMPT 'BAD window start  (YYYY-MM-DD HH24:MI:SS): '
+ACCEPT p_bad_end    CHAR PROMPT 'BAD window end    (YYYY-MM-DD HH24:MI:SS): '
+ACCEPT p_good_start CHAR PROMPT 'GOOD window start (YYYY-MM-DD HH24:MI:SS): '
+ACCEPT p_good_end   CHAR PROMPT 'GOOD window end   (YYYY-MM-DD HH24:MI:SS): '
+ACCEPT p_qc_sid     CHAR PROMPT 'QC SID for fixed-QC sections (optional): '
+ACCEPT p_qc_inst    CHAR PROMPT 'QC INST for fixed-QC sections (optional): '
+
+DEFINE sql_id     = '&p_sql_id'
+DEFINE bad_start  = '&p_bad_start'
+DEFINE bad_end    = '&p_bad_end'
+DEFINE good_start = '&p_good_start'
+DEFINE good_end   = '&p_good_end'
+DEFINE qc_sid     = '&p_qc_sid'
+DEFINE qc_inst    = '&p_qc_inst'
+
+COLUMN begin_time FORMAT A19
+COLUMN end_time   FORMAT A19
+COLUMN snap_time  FORMAT A19
+COLUMN first_seen FORMAT A19
+COLUMN last_seen  FORMAT A19
+COLUMN event FORMAT A40
+COLUMN state FORMAT A40
+COLUMN wait_class FORMAT A18
+COLUMN operation FORMAT A30
+COLUMN options FORMAT A25
+COLUMN object_owner FORMAT A20
+COLUMN object_name FORMAT A35
+COLUMN sql_exec_start FORMAT A19
+COLUMN status FORMAT A12
+COLUMN module FORMAT A30
+COLUMN service_name FORMAT A20
+
+PROMPT ============================================================================
+PROMPT SQL COMPARE PACK
+PROMPT SQL_ID     : &&sql_id
+PROMPT BAD WINDOW : &&bad_start  -> &&bad_end
+PROMPT GOOD WINDOW: &&good_start -> &&good_end
+PROMPT QC FIXED   : &&qc_sid / &&qc_inst
+PROMPT ============================================================================
+
+PROMPT
+PROMPT [1] EXECUTION PROFILE BY SNAPSHOT
+SELECT ss.instance_number,
+       ss.snap_id,
+       TO_CHAR(sn.begin_interval_time,'YYYY-MM-DD HH24:MI:SS') AS begin_time,
+       TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI:SS')   AS end_time,
+       ss.plan_hash_value,
+       ss.executions_delta AS execs,
+       ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_elapsed_s,
+       ROUND(ss.cpu_time_delta     / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_cpu_s,
+       ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_iowait_s,
+       ROUND(ss.clwait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_clwait_s,
+       ROUND(ss.ccwait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_ccwait_s,
+       ROUND(ss.apwait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_apwait_s,
+       ROUND(ss.disk_reads_delta   / NULLIF(ss.executions_delta,0), 2)       AS avg_disk_reads,
+       ROUND(ss.buffer_gets_delta  / NULLIF(ss.executions_delta,0), 2)       AS avg_buffer_gets,
+       ROUND(ss.rows_processed_delta / NULLIF(ss.executions_delta,0), 2)     AS avg_rows,
+       ss.px_servers_execs_delta
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.sql_id = '&&sql_id'
+  AND  ss.dbid = (SELECT dbid FROM v$database)
+ORDER  BY sn.end_interval_time, ss.instance_number;
+
+PROMPT
+PROMPT [2] BAD VS GOOD SUMMARY
+WITH base AS (
+  SELECT 'BAD' AS bucket,
+         ss.executions_delta AS execs,
+         ss.elapsed_time_delta,
+         ss.cpu_time_delta,
+         ss.iowait_delta,
+         ss.disk_reads_delta,
+         ss.rows_processed_delta
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.sql_id = '&&sql_id'
+    AND  ss.dbid = (SELECT dbid FROM v$database)
+    AND  sn.end_interval_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                                 AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+  UNION ALL
+  SELECT 'GOOD' AS bucket,
+         ss.executions_delta AS execs,
+         ss.elapsed_time_delta,
+         ss.cpu_time_delta,
+         ss.iowait_delta,
+         ss.disk_reads_delta,
+         ss.rows_processed_delta
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.sql_id = '&&sql_id'
+    AND  ss.dbid = (SELECT dbid FROM v$database)
+    AND  sn.end_interval_time BETWEEN TO_DATE('&&good_start','YYYY-MM-DD HH24:MI:SS')
+                                 AND TO_DATE('&&good_end','YYYY-MM-DD HH24:MI:SS')
+)
+SELECT bucket,
+       SUM(execs) AS execs,
+       ROUND(SUM(elapsed_time_delta)/NULLIF(SUM(execs),0)/1e6,2) AS avg_elapsed_s,
+       ROUND(SUM(cpu_time_delta)/NULLIF(SUM(execs),0)/1e6,2)     AS avg_cpu_s,
+       ROUND(SUM(iowait_delta)/NULLIF(SUM(execs),0)/1e6,2)       AS avg_iowait_s,
+       ROUND(SUM(disk_reads_delta)/NULLIF(SUM(execs),0),2)       AS avg_disk_reads,
+       ROUND(SUM(rows_processed_delta)/NULLIF(SUM(execs),0),2)   AS avg_rows
+FROM   base
+GROUP  BY bucket
+ORDER  BY bucket;
+
+PROMPT
+PROMPT [3] PLAN HASH COMPARISON
+SELECT ss.plan_hash_value,
+       MIN(sn.begin_interval_time) AS first_seen,
+       MAX(sn.end_interval_time)   AS last_seen,
+       SUM(ss.executions_delta)    AS execs,
+       ROUND(SUM(ss.elapsed_time_delta) / NULLIF(SUM(ss.executions_delta),0) / 1e6, 2) AS avg_elapsed_s,
+       ROUND(SUM(ss.cpu_time_delta)     / NULLIF(SUM(ss.executions_delta),0) / 1e6, 2) AS avg_cpu_s,
+       ROUND(SUM(ss.iowait_delta)       / NULLIF(SUM(ss.executions_delta),0) / 1e6, 2) AS avg_iowait_s
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.sql_id = '&&sql_id'
+  AND  ss.dbid = (SELECT dbid FROM v$database)
+GROUP  BY ss.plan_hash_value
+ORDER  BY execs DESC, avg_elapsed_s DESC;
+
+PROMPT
+PROMPT [4] BAD WINDOW WAIT PROFILE
+SELECT NVL(ash.event, 'ON CPU') AS event,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [5] GOOD WINDOW WAIT PROFILE
+SELECT NVL(ash.event, 'ON CPU') AS event,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.sample_time BETWEEN TO_DATE('&&good_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&good_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [6] QC DISCOVERY IN BAD WINDOW
+SELECT ash.qc_instance_id,
+       ash.qc_session_id,
+       COUNT(*) AS samples,
+       COUNT(DISTINCT ash.session_id) AS px_slave_count,
+       MIN(ash.sample_time) AS first_seen,
+       MAX(ash.sample_time) AS last_seen
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.qc_instance_id, ash.qc_session_id
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [7] SKEW SUMMARY IN BAD WINDOW
+SELECT qc_session_id,
+       qc_instance_id,
+       COUNT(DISTINCT session_id) AS slave_count,
+       MIN(slave_samples) AS min_slave_samples,
+       MAX(slave_samples) AS max_slave_samples,
+       ROUND(MAX(slave_samples) / NULLIF(MIN(slave_samples), 0), 1) AS skew_ratio
+FROM (
+  SELECT ash.qc_session_id,
+         ash.qc_instance_id,
+         ash.session_id,
+         COUNT(*) AS slave_samples
+  FROM   dba_hist_active_sess_history ash
+  WHERE  ash.sql_id = '&&sql_id'
+    AND  ash.dbid = (SELECT dbid FROM v$database)
+    AND  ash.qc_session_id IS NOT NULL
+    AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+  GROUP  BY ash.qc_session_id, ash.qc_instance_id, ash.session_id
+)
+GROUP  BY qc_session_id, qc_instance_id
+ORDER  BY skew_ratio DESC NULLS LAST, slave_count DESC;
+
+PROMPT
+PROMPT [8] HOT PLAN LINES IN BAD WINDOW
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [9] I/O-RELATED EVENT BREAKDOWN IN BAD WINDOW
+SELECT ash.event,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  (
+         ash.wait_class = 'User I/O'
+         OR ash.event LIKE 'direct path%'
+         OR ash.event LIKE 'cell%'
+         OR ash.event LIKE 'db file%'
+      )
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.event, ash.wait_class
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [10] I/O-HEAVY PLAN LINES IN BAD WINDOW
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  (
+         ash.wait_class = 'User I/O'
+         OR ash.event IN ('direct path read temp','direct path write temp')
+         OR ash.event LIKE 'cell%'
+         OR ash.event LIKE 'db file%'
+      )
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [11] TEMP-HEAVY SESSIONS IN BAD WINDOW
+SELECT ash.session_id,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.event IN ('direct path read temp','direct path write temp')
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.session_id, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
+
+PROMPT
+PROMPT [12] CROSS-INSTANCE PX ACTIVITY IN BAD WINDOW
+SELECT ash.instance_number AS slave_instance,
+       ash.qc_instance_id  AS qc_instance,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id IS NOT NULL
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.instance_number, ash.qc_instance_id
+ORDER  BY samples DESC;
+
+PROMPT
+PROMPT [13] WORST SNAPSHOTS BY I/O WAIT
+SELECT *
+FROM (
+  SELECT ss.instance_number,
+         ss.snap_id,
+         TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI:SS') AS snap_time,
+         ss.plan_hash_value,
+         ss.executions_delta AS execs,
+         ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_elapsed_s,
+         ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_iowait_s,
+         ROUND(ss.disk_reads_delta   / NULLIF(ss.executions_delta,0), 2)       AS avg_disk_reads,
+         ROUND((ss.disk_reads_delta * 8) / 1024 / NULLIF(ss.executions_delta,0), 2) AS mb_read_per_exec,
+         ROUND(((ss.disk_reads_delta * 8) / 1024) / NULLIF(ss.elapsed_time_delta/1e6,0), 2) AS mb_per_s
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.sql_id = '&&sql_id'
+    AND  ss.dbid = (SELECT dbid FROM v$database)
+    AND  ss.executions_delta > 0
+  ORDER  BY avg_iowait_s DESC NULLS LAST
+)
+WHERE ROWNUM <= 20;
+
+PROMPT
+PROMPT [14] LIVE EXECUTION DISCOVERY
+SELECT m.inst_id,
+       m.sid AS qc_session_id,
+       m.session_serial#,
+       m.sql_exec_id,
+       TO_CHAR(m.sql_exec_start, 'YYYY-MM-DD HH24:MI:SS') AS sql_exec_start,
+       m.status,
+       ROUND(m.elapsed_time / 1e6, 2) AS elapsed_s,
+       ROUND(m.cpu_time / 1e6, 2) AS cpu_s,
+       ROUND(m.user_io_wait_time / 1e6, 2) AS io_wait_s,
+       m.buffer_gets,
+       m.disk_reads,
+       m.px_servers_requested,
+       m.px_servers_allocated,
+       m.sql_plan_hash_value,
+       m.module,
+       m.service_name
+FROM   gv$sql_monitor m
+WHERE  m.sql_id = '&&sql_id'
+ORDER  BY m.sql_exec_start DESC, m.inst_id, m.sid;
+
+PROMPT
+PROMPT [15] ASM REBALANCE STATUS
+SELECT group_number,
+       operation,
+       state,
+       power,
+       actual,
+       sofar,
+       est_work,
+       est_rate,
+       est_minutes,
+       error_code
+FROM   v$asm_operation;
+
+PROMPT
+PROMPT [16] BIND CAPTURE
+SELECT sql_id,
+       child_number,
+       name,
+       position,
+       datatype_string,
+       value_string,
+       last_captured
+FROM   v$sql_bind_capture
+WHERE  sql_id = '&&sql_id'
+ORDER  BY child_number, position;
+
+PROMPT
+PROMPT [17] OPTIONAL FIXED-QC SECTIONS
+PROMPT (These only return rows if QC SID and QC INST were provided)
+
+SELECT ash.qc_session_id,
+       ash.qc_instance_id,
+       ash.session_id,
+       ash.session_serial#,
+       ash.instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 1) AS est_active_min
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER(NVL(NULLIF('&&qc_sid',''), '-1'))
+  AND  ash.qc_instance_id = TO_NUMBER(NVL(NULLIF('&&qc_inst',''), '-1'))
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.qc_session_id,
+          ash.qc_instance_id,
+          ash.session_id,
+          ash.session_serial#,
+          ash.instance_number
+ORDER  BY samples DESC;
+
+SELECT NVL(ash.event, 'ON CPU') AS state,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct
+FROM   dba_hist_active_sess_history ash
+WHERE  ash.sql_id = '&&sql_id'
+  AND  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.qc_session_id = TO_NUMBER(NVL(NULLIF('&&qc_sid',''), '-1'))
+  AND  ash.qc_instance_id = TO_NUMBER(NVL(NULLIF('&&qc_inst',''), '-1'))
+  AND  ash.sample_time BETWEEN TO_DATE('&&bad_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&&bad_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(ash.event, 'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+UNDEFINE sql_id
+UNDEFINE bad_start
+UNDEFINE bad_end
+UNDEFINE good_start
+UNDEFINE good_end
+UNDEFINE qc_sid
+UNDEFINE qc_inst
+
+
+
+
+
+
+=================
+
+
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exadata cell-side RCA collector
+# Collects current cell metrics and optional history in one shot.
+# Designed for readability under time pressure.
+#
+# Requirements:
+#   - dcli installed on the caller host
+#   - passwordless connectivity to storage cells
+#   - group file listing storage cells
+#
+# Notes:
+#   - Current metric sections are reliable for active incidents.
+#   - History collection is best-effort because metric names / filters can vary by image release.
+#   - This script is read-only. It does not modify cells.
+
+GROUP_FILE="/root/cell_group"
+REMOTE_USER="root"
+OUTDIR="./cell_rca_$(date +%Y%m%d_%H%M%S)"
+START_TS=""
+END_TS=""
+KEEP_RAW=0
+
+usage() {
+  cat <<'USAGE'
+Usage: exadata_cell_rca.sh [-g group_file] [-u remote_user] [-o outdir] [-s start_ts] [-e end_ts] [-k]
+
+  -g  dcli group file for storage cells (default: /root/cell_group)
+  -u  remote user (default: root)
+  -o  output directory (default: ./cell_rca_<timestamp>)
+  -s  optional start timestamp for history extraction, format: YYYY-MM-DD HH:MI:SS
+  -e  optional end timestamp for history extraction, format: YYYY-MM-DD HH:MI:SS
+  -k  keep raw dcli output files (raw files are kept by default regardless; this flag is informational)
+  -h  show help
+
+Examples:
+  ./exadata_cell_rca.sh
+  ./exadata_cell_rca.sh -g /root/cell_group -o /tmp/cell_rca_now
+  ./exadata_cell_rca.sh -s '2026-03-21 05:00:00' -e '2026-03-21 09:30:00'
+USAGE
+}
+
+while getopts ":g:u:o:s:e:kh" opt; do
+  case "$opt" in
+    g) GROUP_FILE="$OPTARG" ;;
+    u) REMOTE_USER="$OPTARG" ;;
+    o) OUTDIR="$OPTARG" ;;
+    s) START_TS="$OPTARG" ;;
+    e) END_TS="$OPTARG" ;;
+    k) KEEP_RAW=1 ;;
+    h) usage; exit 0 ;;
+    :) echo "Option -$OPTARG requires an argument" >&2; usage; exit 1 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+  esac
+done
+
+if [[ ! -f "$GROUP_FILE" ]]; then
+  echo "Group file not found: $GROUP_FILE" >&2
+  exit 1
+fi
+
+if [[ -n "$START_TS" && -z "$END_TS" ]] || [[ -z "$START_TS" && -n "$END_TS" ]]; then
+  echo "Provide both -s and -e, or neither." >&2
+  exit 1
+fi
+
+mkdir -p "$OUTDIR"
+SUMMARY_FILE="$OUTDIR/00_summary.txt"
+RAW_DIR="$OUTDIR/raw"
+mkdir -p "$RAW_DIR"
+
+START_GREP=""
+END_GREP=""
+if [[ -n "$START_TS" ]]; then
+  START_GREP="${START_TS/ /T}"
+  END_GREP="${END_TS/ /T}"
+fi
+
+section() {
+  local title="$1"
+  {
+    echo
+    echo "===================================================================="
+    echo "$title"
+    echo "===================================================================="
+  } | tee -a "$SUMMARY_FILE"
+}
+
+run_dcli() {
+  local label="$1"
+  local cmd="$2"
+  local outfile="$RAW_DIR/${label}.txt"
+
+  echo "[RUNNING] $label" | tee -a "$SUMMARY_FILE"
+  if dcli -g "$GROUP_FILE" -l "$REMOTE_USER" "$cmd" > "$outfile" 2>&1; then
+    :
+  else
+    echo "[WARN] dcli section failed: $label" | tee -a "$SUMMARY_FILE"
+  fi
+}
+
+append_top_lines() {
+  local label="$1"
+  local lines="${2:-200}"
+  local file="$RAW_DIR/${label}.txt"
+  if [[ -f "$file" ]]; then
+    {
+      echo "--- $label ---"
+      sed -n "1,${lines}p" "$file"
+    } >> "$SUMMARY_FILE"
+  fi
+}
+
+section "INPUTS"
+{
+  echo "Group file : $GROUP_FILE"
+  echo "Remote user: $REMOTE_USER"
+  echo "Output dir : $OUTDIR"
+  if [[ -n "$START_TS" ]]; then
+    echo "History from: $START_TS"
+    echo "History to  : $END_TS"
+  else
+    echo "History     : not requested"
+  fi
+  echo
+  echo "Read this summary in this order:"
+  echo "  1) CURRENT DISK LATENCY"
+  echo "  2) CURRENT UTILIZATION"
+  echo "  3) CURRENT CELLSRV METRICS"
+  echo "  4) ALERT LOG CLUES"
+} | tee -a "$SUMMARY_FILE"
+
+# 1) Environment / version / cell state
+run_dcli "01_env" "bash -lc 'echo HOST=\$(hostname -s); date; uptime; echo; imageinfo 2>/dev/null | head -40; echo; cellcli -e \"list cell detail\" 2>/dev/null | egrep -i \"name:|status:|cellVersion:|releaseImageVersion:|cpuCount:|ramCacheMaxSize:|flashCacheMode:|flashCacheCompress:|offloadGroupName:|diagHistoryDays:\"'"
+section "CELL ENVIRONMENT / VERSION / BASIC STATE"
+append_top_lines "01_env" 300
+
+# 2) Alert log clues
+run_dcli "02_alertlog" "bash -lc 'echo HOST=\$(hostname -s); echo; egrep -i \"rebalance|grid disk|griddisk|celldisk|flashdisk|resize|drop|create|online|offline|warning|error|critical|asm\" /var/log/cellos/alert.log 2>/dev/null | tail -200'"
+section "ALERT LOG CLUES (rebalance / disk / warnings / errors)"
+append_top_lines "02_alertlog" 260
+
+# 3) Current cellsrv metrics: IOPS / BYTES / offload / flash cache
+run_dcli "03_cellsrv_current" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metriccurrent where metricObjectName = \'CELLSRV\' attributes metricObjectName,name,metricValue\" 2>/dev/null | egrep -i \"IO_RQ_|IO_BY_|FC_|SAVED|OPTIMIZED|OFFLOAD\"'"
+section "CURRENT CELLSRV METRICS (IOPS / MBPS / offload / flash cache)"
+append_top_lines "03_cellsrv_current" 300
+
+# 4) Current celldisk + flashdisk latency
+run_dcli "04_latency_current" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metriccurrent attributes metricObjectName,name,metricValue\" 2>/dev/null | egrep -i \"(CELLDISK|FLASHDISK).*(CD_IO_.*_LAT|FD_IO_.*_LAT)|(^[[:space:]]*(CELLDISK|FLASHDISK))\"'"
+section "CURRENT DISK LATENCY (CELLDISK / FLASHDISK)"
+append_top_lines "04_latency_current" 350
+
+# 5) Current utilization
+run_dcli "05_util_current" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metriccurrent attributes metricObjectName,name,metricValue\" 2>/dev/null | egrep -i \"(CELLDISK|GRIDDISK).*(CD_UTIL|GD_UTIL)|(^[[:space:]]*(CELLDISK|GRIDDISK))\"'"
+section "CURRENT UTILIZATION (CELLDISK / GRIDDISK)"
+append_top_lines "05_util_current" 350
+
+# 6) OS perspective on the cell
+run_dcli "06_os_iostat" "bash -lc 'echo HOST=\$(hostname -s); echo; iostat -xmd 1 3 2>/dev/null; echo; vmstat 1 5 2>/dev/null'"
+section "OS VIEW (iostat / vmstat)"
+append_top_lines "06_os_iostat" 300
+
+# 7) Optional history sections
+if [[ -n "$START_TS" ]]; then
+  run_dcli "07_hist_cellsrv" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metrichistory where metricObjectName = \'CELLSRV\' attributes metricObjectName,name,collectionTime,metricValue\" 2>/dev/null | egrep -i \"IO_RQ_|IO_BY_|FC_|SAVED|OPTIMIZED|OFFLOAD\" | egrep \"${START_GREP:0:13}|${END_GREP:0:13}|${START_GREP:0:10}|${END_GREP:0:10}\"'"
+  section "HISTORICAL CELLSRV METRICS (best-effort filtered)"
+  append_top_lines "07_hist_cellsrv" 400
+
+  run_dcli "08_hist_latency" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metrichistory attributes metricObjectName,name,collectionTime,metricValue\" 2>/dev/null | egrep -i \"(CELLDISK|FLASHDISK).*(CD_IO_.*_LAT|FD_IO_.*_LAT)\" | egrep \"${START_GREP:0:13}|${END_GREP:0:13}|${START_GREP:0:10}|${END_GREP:0:10}\"'"
+  section "HISTORICAL LATENCY METRICS (best-effort filtered)"
+  append_top_lines "08_hist_latency" 400
+
+  run_dcli "09_hist_util" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metrichistory attributes metricObjectName,name,collectionTime,metricValue\" 2>/dev/null | egrep -i \"(CELLDISK|GRIDDISK).*(CD_UTIL|GD_UTIL)\" | egrep \"${START_GREP:0:13}|${END_GREP:0:13}|${START_GREP:0:10}|${END_GREP:0:10}\"'"
+  section "HISTORICAL UTILIZATION METRICS (best-effort filtered)"
+  append_top_lines "09_hist_util" 400
+fi
+
+section "QUICK INTERPRETATION GUIDE"
+{
+  cat <<'GUIDE'
+1) If H20 / CELLDISK latency and utilization are both elevated, that supports real storage-side pressure.
+2) If small-read IOPS are very high but latency remains low, that usually means workload shape changed, not that storage is failing.
+3) If FI / FLASHDISK latency is healthy, flash is probably not the bottleneck.
+4) If direct-path-temp waits are high on the database side AND H20 latency/utilization are elevated, storage may be amplifying spill-heavy SQL.
+5) If alert.log shows rebalance / grid disk create/drop/resize overlapping the incident, include that as a contributing factor in the RCA.
+6) Compare good and bad windows side by side. Do not conclude a storage bottleneck from IOPS alone; always check latency and utilization.
+GUIDE
+} | tee -a "$SUMMARY_FILE"
+
+section "OUTPUT"
+{
+  echo "Summary report : $SUMMARY_FILE"
+  echo "Raw outputs    : $RAW_DIR"
+  if [[ -n "$START_TS" ]]; then
+    echo "History window : $START_TS to $END_TS"
+  fi
+} | tee -a "$SUMMARY_FILE"
+
+printf '\nDone. Review: %s\n' "$SUMMARY_FILE"
