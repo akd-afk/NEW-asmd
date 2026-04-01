@@ -1,3 +1,10 @@
+We have completed a focused review of the production performance issue, and the current working direction is that the trigger appears to be associated with the recent storage expansion activity. Since cancelling the ASM rebalance, database performance has shown stabilization and the environment is being monitored closely ahead of tonight’s batch window.
+
+As part of the mitigation plan, a small set of online database parameter changes is being implemented this evening. These changes do not require a restart. To be clear, these parameter updates are not considered the root cause of the issue. They are being applied to help reduce the symptoms observed earlier, specifically to minimize the temp-spill and related wait-event behavior seen during the affected runs.
+
+In parallel, a Sev1 SR has already been opened with Oracle Support so that Oracle is proactively engaged during tonight’s processing window if any issue reappears. A targeted validation job will also be run after the parameter changes are in place to confirm that the same direct path read temp behavior is not being seen in the test workload. Based on the latest storage and database review, the newer cells appear healthy, while the earlier investigation indicated heavier load concentration on the existing cells. We will continue active monitoring through tonight’s batch and provide the next update with the outcome and any further actions.
+
+
 ALTER SYSTEM SET asm_diskstring = 'o/*/DATAC1_*','o/*/RECOC1_*' SCOPE=BOTH SID='*';
 
 #!/usr/bin/env bash
