@@ -1,3 +1,372 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exadata cell RCA v3
+#
+# Purpose:
+#   Drill into cell-side queuing, busy disks on existing cells, smart-scan health,
+#   active requests, alert-log evidence, and current-vs-point-in-time collection.
+#
+# Design principles:
+#   - Keep remote commands simple.
+#   - Collect broad raw output first.
+#   - Filter and summarize locally so grep/no-match does not look like a cell failure.
+#   - Support optional "existing cells" and "new cells" group files for side-by-side review.
+#
+# Usage:
+#   ./exadata_cell_rca_v3.sh
+#   ./exadata_cell_rca_v3.sh -g /root/cell_group
+#   ./exadata_cell_rca_v3.sh -O /root/existing_cells -N /root/new_cells
+#   ./exadata_cell_rca_v3.sh -s '2026-03-21 05:00:00' -e '2026-03-21 09:30:00'
+#
+# Notes:
+#   - Current-state sections are strongest and safest.
+#   - History sections are best-effort because metric naming and formatting vary by image/release.
+#   - If old/new group files are supplied, the script produces separate raw collections and summaries.
+#   - This script is read-only.
+
+GROUP_FILE="/root/cell_group"
+OLD_GROUP_FILE=""
+NEW_GROUP_FILE=""
+REMOTE_USER="root"
+OUTDIR="./cell_rca_v3_$(date +%Y%m%d_%H%M%S)"
+START_TS=""
+END_TS=""
+KEEP_RAW=1
+
+usage() {
+  cat <<'EOF'
+Usage: exadata_cell_rca_v3.sh [-g group_file] [-O old_group_file] [-N new_group_file] [-u remote_user] [-o outdir] [-s start_ts] [-e end_ts]
+
+  -g  dcli group file for all cells (default: /root/cell_group)
+  -O  optional dcli group file for existing / older cells
+  -N  optional dcli group file for new / expanded cells
+  -u  remote user (default: root)
+  -o  output directory (default: ./cell_rca_v3_<timestamp>)
+  -s  optional start timestamp for history / point-in-time review, format: YYYY-MM-DD HH:MI:SS
+  -e  optional end timestamp for history / point-in-time review, format: YYYY-MM-DD HH:MI:SS
+
+Examples:
+  ./exadata_cell_rca_v3.sh
+  ./exadata_cell_rca_v3.sh -g /root/cell_group -o /tmp/cell_rca_v3
+  ./exadata_cell_rca_v3.sh -O /root/existing_cells -N /root/new_cells
+  ./exadata_cell_rca_v3.sh -s '2026-03-21 05:00:00' -e '2026-03-21 09:30:00'
+EOF
+}
+
+while getopts ":g:O:N:u:o:s:e:h" opt; do
+  case "$opt" in
+    g) GROUP_FILE="$OPTARG" ;;
+    O) OLD_GROUP_FILE="$OPTARG" ;;
+    N) NEW_GROUP_FILE="$OPTARG" ;;
+    u) REMOTE_USER="$OPTARG" ;;
+    o) OUTDIR="$OPTARG" ;;
+    s) START_TS="$OPTARG" ;;
+    e) END_TS="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) echo "Option -$OPTARG requires an argument" >&2; usage; exit 1 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
+  esac
+done
+
+if ! command -v dcli >/dev/null 2>&1; then
+  echo "dcli not found in PATH" >&2
+  exit 1
+fi
+
+if [[ ! -f "$GROUP_FILE" ]]; then
+  echo "Group file not found: $GROUP_FILE" >&2
+  exit 1
+fi
+
+if [[ -n "$OLD_GROUP_FILE" && ! -f "$OLD_GROUP_FILE" ]]; then
+  echo "Existing-cells group file not found: $OLD_GROUP_FILE" >&2
+  exit 1
+fi
+
+if [[ -n "$NEW_GROUP_FILE" && ! -f "$NEW_GROUP_FILE" ]]; then
+  echo "New-cells group file not found: $NEW_GROUP_FILE" >&2
+  exit 1
+fi
+
+if [[ -n "$START_TS" && -z "$END_TS" ]] || [[ -z "$START_TS" && -n "$END_TS" ]]; then
+  echo "Provide both -s and -e, or neither." >&2
+  exit 1
+fi
+
+mkdir -p "$OUTDIR"
+RAW_DIR="$OUTDIR/raw"
+mkdir -p "$RAW_DIR"
+SUMMARY_FILE="$OUTDIR/00_summary.txt"
+
+section() {
+  local title="$1"
+  {
+    echo
+    echo "===================================================================="
+    echo "$title"
+    echo "===================================================================="
+  } | tee -a "$SUMMARY_FILE"
+}
+
+run_dcli_capture() {
+  local grp="$1"
+  local label="$2"
+  local remote_cmd="$3"
+  local outfile="$RAW_DIR/${label}.txt"
+
+  {
+    echo
+    echo "### $label"
+    echo "group_file=$grp"
+    echo "remote_user=$REMOTE_USER"
+    echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
+  } >> "$SUMMARY_FILE"
+
+  if dcli -g "$grp" -l "$REMOTE_USER" "$remote_cmd" > "$outfile" 2>&1; then
+    echo "[OK] $label" >> "$SUMMARY_FILE"
+  else
+    echo "[WARN] collection failed for $label" >> "$SUMMARY_FILE"
+  fi
+}
+
+append_file_head() {
+  local label="$1"
+  local lines="${2:-200}"
+  local file="$RAW_DIR/${label}.txt"
+  if [[ -f "$file" ]]; then
+    {
+      echo "--- $label ---"
+      sed -n "1,${lines}p" "$file"
+    } >> "$SUMMARY_FILE"
+  fi
+}
+
+append_local_filter() {
+  local title="$1"
+  local infile="$2"
+  local pattern="$3"
+  local lines="${4:-200}"
+  {
+    echo "--- $title ---"
+    if [[ -f "$infile" ]]; then
+      grep -Ei "$pattern" "$infile" | sed -n "1,${lines}p" || true
+    else
+      echo "raw file not found: $infile"
+    fi
+  } >> "$SUMMARY_FILE"
+}
+
+append_local_counts() {
+  local title="$1"
+  local infile="$2"
+  local pattern="$3"
+  {
+    echo "--- $title ---"
+    if [[ -f "$infile" ]]; then
+      grep -Ei "$pattern" "$infile" | sed 's/^[^:]*://' | sort | uniq -c | sort -nr | sed -n '1,80p' || true
+    else
+      echo "raw file not found: $infile"
+    fi
+  } >> "$SUMMARY_FILE"
+}
+
+collect_for_group() {
+  local grp="$1"
+  local prefix="$2"
+
+  run_dcli_capture "$grp" "${prefix}_01_env" "bash -lc 'echo HOST=\$(hostname -s); date; uptime; imageinfo 2>/dev/null | head -40; echo; cellcli -e \"list cell detail\" 2>/dev/null'"
+  run_dcli_capture "$grp" "${prefix}_02_activerequest" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list activerequest detail\" 2>/dev/null'"
+  run_dcli_capture "$grp" "${prefix}_03_metriccurrent" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metriccurrent attributes metricObjectName,name,metricValue\" 2>/dev/null'"
+  run_dcli_capture "$grp" "${prefix}_04_alertlog" "bash -lc 'echo HOST=\$(hostname -s); echo; tail -2000 /var/log/cellos/alert.log 2>/dev/null'"
+  run_dcli_capture "$grp" "${prefix}_05_iostat" "bash -lc 'echo HOST=\$(hostname -s); echo; iostat -xmd 1 3 2>/dev/null; echo; vmstat 1 5 2>/dev/null'"
+  run_dcli_capture "$grp" "${prefix}_06_cellcli_objects" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list griddisk attributes name,asmDiskGroupName,size,status\" 2>/dev/null; echo; cellcli -e \"list celldisk attributes name,deviceName,physicalFirmware,physicalInterface,slotNumber,size,status,diskType\" 2>/dev/null; echo; cellcli -e \"list flashdisk attributes name,status,size\" 2>/dev/null'"
+  run_dcli_capture "$grp" "${prefix}_06b_cell_status" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list cell attributes name,status,releaseImageStatus,upTime,cellVersion\" 2>/dev/null'"
+
+  if [[ -n "$START_TS" ]]; then
+    # Best-effort history dump. Intentionally broad; we filter locally after collection.
+    run_dcli_capture "$grp" "${prefix}_07_metrichistory" "bash -lc 'echo HOST=\$(hostname -s); echo; cellcli -e \"list metrichistory attributes metricObjectName,name,collectionTime,metricValue\" 2>/dev/null'"
+  fi
+}
+
+summarize_group() {
+  local prefix="$1"
+  local title="$2"
+
+  section "$title"
+
+  append_file_head "${prefix}_01_env" 220
+
+  append_local_filter "CELL HEALTH STATUS"     "$RAW_DIR/${prefix}_06b_cell_status.txt"     'HOST=|name:|status:|releaseImageStatus:|upTime:|cellVersion:'     220
+
+  append_local_filter "GRIDDISK / CELLDISK / FLASHDISK STATUS"     "$RAW_DIR/${prefix}_06_cellcli_objects.txt"     'HOST=|asmDiskGroupName|diskType|deviceName|slotNumber|size:|status:'     320
+
+  append_local_counts "STATUS COUNTS FROM OBJECT STATUS SECTION"     "$RAW_DIR/${prefix}_06_cellcli_objects.txt"     'status:'
+
+  append_local_filter "ACTIVE REQUESTS (raw highlights)" \
+    "$RAW_DIR/${prefix}_02_activerequest.txt" \
+    'HOST=|activeRequest|requestType|objectName|cellDisk|gridDisk|flashDisk|dbUniqueName|dbID|sqlId|sessionId|requestTime|elapsedTime|waitTime|state|status|reason' \
+    260
+
+  append_local_counts "ACTIVE REQUESTS KEYWORDS (counted view)" \
+    "$RAW_DIR/${prefix}_02_activerequest.txt" \
+    'requestType|state|status|reason'
+
+  append_local_filter "CURRENT QUEUE / LATENCY / UTILIZATION SIGNALS" \
+    "$RAW_DIR/${prefix}_03_metriccurrent.txt" \
+    'HOST=|IO_RQ_|IO_BY_|_LAT|UTIL|FC_|SAVED|OPTIMIZED|OFFLOAD|SM_R|LG_R|SM_W|LG_W|CELLSRV|CELLDISK|GRIDDISK|FLASHDISK' \
+    420
+
+  append_local_filter "CURRENT SMART-SCAN / OFFLOAD SIGNALS" \
+    "$RAW_DIR/${prefix}_03_metriccurrent.txt" \
+    'HOST=|OFFLOAD|OPTIMIZED|SAVED|FC_' \
+    220
+
+  append_local_filter "CURRENT CELLDISK / FLASHDISK LATENCY SIGNALS" \
+    "$RAW_DIR/${prefix}_03_metriccurrent.txt" \
+    'HOST=|CELLDISK|FLASHDISK|_LAT' \
+    260
+
+  append_local_filter "CURRENT UTILIZATION SIGNALS" \
+    "$RAW_DIR/${prefix}_03_metriccurrent.txt" \
+    'HOST=|CELLDISK|GRIDDISK|UTIL' \
+    260
+
+  append_local_filter "ALERT LOG EVIDENCE (rebalance / errors / warnings / disk state)" \
+    "$RAW_DIR/${prefix}_04_alertlog.txt" \
+    'HOST=|rebalance|asm|grid disk|griddisk|celldisk|flashdisk|resize|drop|create|online|offline|warning|error|critical|cellsrv|smart scan|offload|exception|queue|queued' \
+    320
+
+  append_file_head "${prefix}_05_iostat" 260
+
+  if [[ -n "$START_TS" ]]; then
+    append_local_filter "HISTORY NEAR REQUESTED WINDOW (best effort)" \
+      "$RAW_DIR/${prefix}_07_metrichistory.txt" \
+      "${START_TS:0:13}|${END_TS:0:13}|${START_TS:0:10}|${END_TS:0:10}|HOST=|IO_RQ_|IO_BY_|_LAT|UTIL|OFFLOAD|OPTIMIZED|SAVED" \
+      420
+  fi
+}
+
+compare_old_new() {
+  local oldp="$1"
+  local newp="$2"
+
+  if [[ -z "$OLD_GROUP_FILE" || -z "$NEW_GROUP_FILE" ]]; then
+    return 0
+  fi
+
+  section "OLD VS NEW CELLS - OPERATOR INTERPRETATION"
+
+  {
+    echo "Use this section to compare whether pressure is isolated to older cells."
+    echo
+    echo "What to look for:"
+    echo "  1) Existing cells show many ACTIVE REQUEST entries while new cells do not"
+    echo "  2) Existing cells show higher CELLDISK latency or utilization"
+    echo "  3) Existing cells show healthy flash but busy disks, matching ACS feedback"
+    echo "  4) Existing cells show weaker OFFLOAD / OPTIMIZED / SAVED signals"
+    echo "  5) Alert log on existing cells shows warnings or state changes while new cells stay clean"
+    echo
+    echo "If existing cells are busy and queued while new cells are healthy, rebalance stop alone may not explain"
+    echo "why performance did not recover. That points more toward workload concentration or smart-scan degradation on"
+    echo "existing cells, exactly as ACS suggested."
+  } >> "$SUMMARY_FILE"
+
+  append_local_filter "EXISTING CELLS - ACTIVE REQUESTS QUICK VIEW" \
+    "$RAW_DIR/${oldp}_02_activerequest.txt" \
+    'HOST=|requestType|state|status|elapsedTime|waitTime|reason' \
+    180
+
+  append_local_filter "NEW CELLS - ACTIVE REQUESTS QUICK VIEW" \
+    "$RAW_DIR/${newp}_02_activerequest.txt" \
+    'HOST=|requestType|state|status|elapsedTime|waitTime|reason' \
+    180
+
+  append_local_filter "EXISTING CELLS - LATENCY / UTIL QUICK VIEW" \
+    "$RAW_DIR/${oldp}_03_metriccurrent.txt" \
+    'HOST=|CELLDISK|FLASHDISK|GRIDDISK|_LAT|UTIL' \
+    220
+
+  append_local_filter "NEW CELLS - LATENCY / UTIL QUICK VIEW" \
+    "$RAW_DIR/${newp}_03_metriccurrent.txt" \
+    'HOST=|CELLDISK|FLASHDISK|GRIDDISK|_LAT|UTIL' \
+    220
+
+  append_local_filter "EXISTING CELLS - SMART SCAN / OFFLOAD QUICK VIEW" \
+    "$RAW_DIR/${oldp}_03_metriccurrent.txt" \
+    'HOST=|OFFLOAD|OPTIMIZED|SAVED|FC_' \
+    180
+
+  append_local_filter "NEW CELLS - SMART SCAN / OFFLOAD QUICK VIEW" \
+    "$RAW_DIR/${newp}_03_metriccurrent.txt" \
+    'HOST=|OFFLOAD|OPTIMIZED|SAVED|FC_' \
+    180
+}
+
+section "INPUTS"
+{
+  echo "All cells group : $GROUP_FILE"
+  if [[ -n "$OLD_GROUP_FILE" ]]; then echo "Existing cells  : $OLD_GROUP_FILE"; fi
+  if [[ -n "$NEW_GROUP_FILE" ]]; then echo "New cells       : $NEW_GROUP_FILE"; fi
+  echo "Remote user     : $REMOTE_USER"
+  echo "Output dir      : $OUTDIR"
+  if [[ -n "$START_TS" ]]; then
+    echo "History window  : $START_TS  ->  $END_TS"
+  else
+    echo "History window  : not requested"
+  fi
+  echo
+  echo "Primary questions this V3 addresses:"
+  echo "  - Are queued requests concentrated on existing cells?"
+  echo "  - Is there alert-log evidence of disk / cell state issues?"
+  echo "  - Is smart-scan / offload behavior degraded?"
+  echo "  - Are disks busy on existing cells but not on new cells?"
+  echo "  - Is this only current-state health or can we get best-effort point-in-time clues?"
+} | tee -a "$SUMMARY_FILE"
+
+# Always collect for all cells.
+collect_for_group "$GROUP_FILE" "all"
+summarize_group "all" "ALL CELLS SUMMARY"
+
+# Optional compare groups.
+if [[ -n "$OLD_GROUP_FILE" ]]; then
+  collect_for_group "$OLD_GROUP_FILE" "old"
+  summarize_group "old" "EXISTING / OLDER CELLS SUMMARY"
+fi
+
+if [[ -n "$NEW_GROUP_FILE" ]]; then
+  collect_for_group "$NEW_GROUP_FILE" "new"
+  summarize_group "new" "NEW / EXPANDED CELLS SUMMARY"
+fi
+
+compare_old_new "old" "new"
+
+section "INTERPRETATION GUIDE"
+{
+  cat <<'EOF'
+1) If ACTIVE REQUESTS are high on existing cells but not on new cells, that supports ACS's current view.
+2) If existing cells show busy CELLDISKs with healthy FLASHDISKs, focus on disk-side queuing, not flash.
+3) If OFFLOAD / OPTIMIZED / SAVED signals look weaker on existing cells, that supports the "smart scans slowing down" concern.
+4) If alert logs are clean but active requests stay high, this may be a workload/queueing problem rather than a cell fault.
+5) If performance did not recover after rebalance stopped, compare existing vs new cells carefully before blaming rebalance itself.
+6) Cell health status and object status sections provide a basic holistic health check across all cells.
+7) History sections are best effort. Current-state sections are the most reliable unless you have ExaWatcher or OEM history.
+EOF
+} | tee -a "$SUMMARY_FILE"
+
+section "OUTPUT"
+{
+  echo "Summary report : $SUMMARY_FILE"
+  echo "Raw outputs    : $RAW_DIR"
+  echo "Recommended read order:"
+  echo "  1) ACTIVE REQUESTS"
+  echo "  2) CURRENT QUEUE / LATENCY / UTILIZATION SIGNALS"
+  echo "  3) CURRENT SMART-SCAN / OFFLOAD SIGNALS"
+  echo "  4) ALERT LOG EVIDENCE"
+  echo "  5) OLD VS NEW CELLS comparison, if group files were supplied"
+} | tee -a "$SUMMARY_FILE"
+
+printf '\nDone. Review: %s\n' "$SUMMARY_FILE"
 
 
 
