@@ -1,0 +1,173 @@
+-- exadata_io_sql_detail_current.sql
+-- Usage:
+--   @exadata_io_sql_detail_current.sql <sql_id> "<start_time>" "<end_time>"
+-- Notes:
+--   - Uses GV$ views
+--   - Best for live / recent windows
+--   - For older windows use exadata_io_sql_detail_historic.sql
+
+set pagesize 5000
+set linesize 300
+set trimspool on
+set tab off
+set verify off
+set feedback on
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+define p_sql_id='&1'
+define p_start='&2'
+define p_end='&3'
+
+column event format a40
+column wait_class format a18
+column operation format a28
+column options format a24
+column object_owner format a20
+column object_name format a35
+column module format a35
+column machine format a35
+column sql_exec_start format a19
+
+prompt ============================================================================
+prompt CURRENT SQL DETAIL DRILLDOWN
+prompt SQL_ID: &p_sql_id
+prompt START : &p_start
+prompt END   : &p_end
+prompt ============================================================================
+
+prompt
+prompt [A] BASIC PROFILE
+SELECT ash.sql_id,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 2) AS approx_active_min,
+       MIN(ash.module) AS module,
+       MIN(ash.machine) AS machine
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.sql_id;
+
+prompt
+prompt [B] WAIT PROFILE
+SELECT NVL(ash.event,'ON CPU') AS event,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(ash.event,'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [C] HOT PLAN LINES
+SELECT ash.sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   gv$active_session_history ash
+LEFT JOIN gv$sql_plan sp
+       ON sp.inst_id = ash.inst_id
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+prompt
+prompt [D] TEMP-SPILL BY SESSION / PLAN LINE
+SELECT ash.session_id,
+       ash.session_serial#,
+       ash.sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.event IN ('direct path read temp','direct path write temp')
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.session_id, ash.session_serial#, ash.sql_plan_line_id
+ORDER  BY temp_samples DESC;
+
+prompt
+prompt [E] CURRENT TEMP USERS FOR THIS SQL
+SELECT s.inst_id,
+       s.sid,
+       s.serial#,
+       s.username,
+       s.sql_id,
+       su.tablespace,
+       ROUND(su.blocks * ts.block_size / 1024 / 1024, 2) AS temp_mb,
+       su.segtype,
+       s.program,
+       s.module
+FROM   gv$sort_usage su
+JOIN   gv$session s
+       ON s.saddr = su.session_addr
+      AND s.inst_id = su.inst_id
+JOIN   dba_tablespaces ts
+       ON ts.tablespace_name = su.tablespace
+WHERE  s.sql_id = '&p_sql_id'
+ORDER  BY temp_mb DESC;
+
+prompt
+prompt [F] WORKAREA / PGA EXECUTION PROFILE
+SELECT sql_id,
+       child_number,
+       operation_type,
+       policy,
+       estimated_optimal_size,
+       estimated_onepass_size,
+       last_memory_used,
+       last_execution,
+       last_degree,
+       total_executions,
+       optimal_executions,
+       onepass_executions,
+       multipasses_executions,
+       active_time
+FROM   v$sql_workarea
+WHERE  sql_id = '&p_sql_id'
+ORDER  BY active_time DESC, operation_type;
+
+prompt
+prompt [G] LIVE SQL MONITOR ENTRIES
+SELECT m.inst_id,
+       m.sid,
+       m.sql_exec_id,
+       TO_CHAR(m.sql_exec_start,'YYYY-MM-DD HH24:MI:SS') AS sql_exec_start,
+       m.status,
+       ROUND(m.elapsed_time/1e6,2) AS elapsed_s,
+       ROUND(m.cpu_time/1e6,2) AS cpu_s,
+       ROUND(m.user_io_wait_time/1e6,2) AS io_wait_s,
+       m.px_servers_requested,
+       m.px_servers_allocated,
+       m.sql_plan_hash_value
+FROM   gv$sql_monitor m
+WHERE  m.sql_id = '&p_sql_id'
+ORDER  BY m.sql_exec_start DESC;
+
+prompt
+prompt [H] SYSTEM PGA SNAPSHOT
+SELECT name, value
+FROM   v$pgastat
+ORDER  BY name;
+
+prompt
+prompt [I] CELL-RELATED SYSTEM STATS SNAPSHOT
+SELECT name, value
+FROM   v$sysstat
+WHERE  name LIKE 'cell%'
+ORDER  BY name;

@@ -1,0 +1,149 @@
+-- exadata_io_drilldown_current.sql
+-- Purpose:
+--   Current / recent point-in-time Exadata + PGA/TEMP drilldown using GV$ views.
+-- Scope:
+--   Best for active incidents or recent windows still covered by in-memory ASH / SQL Monitor.
+-- Usage:
+--   @exadata_io_drilldown_current.sql
+-- Inputs:
+--   start_time : YYYY-MM-DD HH24:MI:SS
+--   end_time   : YYYY-MM-DD HH24:MI:SS
+--   top_n      : number of SQLs to drill into
+
+set pagesize 5000
+set linesize 300
+set trimspool on
+set tab off
+set verify off
+set feedback on
+set serveroutput on size unlimited
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+prompt
+prompt Usage:
+prompt   @exadata_io_drilldown_current.sql
+prompt Then enter:
+prompt   Start time = YYYY-MM-DD HH24:MI:SS
+prompt   End time   = YYYY-MM-DD HH24:MI:SS
+prompt   Top SQL count
+prompt
+prompt Notes:
+prompt   - Uses GV$ACTIVE_SESSION_HISTORY, GV$SQL_MONITOR, GV$SQL_PLAN
+prompt   - Best for live / recent incidents
+prompt   - For older windows, use exadata_io_drilldown_historic.sql
+prompt
+
+accept p_start char prompt 'Start time (YYYY-MM-DD HH24:MI:SS): '
+accept p_end   char prompt 'End time   (YYYY-MM-DD HH24:MI:SS): '
+accept p_topn  char default '10' prompt 'Top SQL count to drill into [10]: '
+
+prompt ============================================================================
+prompt CURRENT / RECENT EXADATA IO + PGA/TEMP DRILLDOWN
+prompt START: &p_start
+prompt END  : &p_end
+prompt TOP N: &p_topn
+prompt ============================================================================
+
+column event format a40
+column wait_class format a18
+column sql_id format a13
+column module format a35
+column machine format a35
+
+prompt
+prompt [1] WINDOW-LEVEL TOP SQL BY ASH SAMPLES
+WITH top_sql AS (
+  SELECT ash.sql_id,
+         COUNT(*) AS samples,
+         ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct,
+         MIN(ash.module) AS module,
+         MIN(ash.machine) AS machine
+  FROM   gv$active_session_history ash
+  WHERE  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  ash.sql_id IS NOT NULL
+  GROUP  BY ash.sql_id
+)
+SELECT *
+FROM (
+  SELECT sql_id, samples, pct, module, machine
+  FROM   top_sql
+  ORDER  BY samples DESC
+)
+WHERE ROWNUM <= TO_NUMBER('&p_topn');
+
+prompt
+prompt [2] WINDOW-LEVEL WAIT PROFILE
+SELECT NVL(ash.event,'ON CPU') AS event,
+       ash.wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history ash
+WHERE  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(ash.event,'ON CPU'), ash.wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [3] TOP SQL BY TEMP / EXADATA / DIRECT PATH PROFILE
+WITH base AS (
+  SELECT ash.sql_id,
+         SUM(CASE WHEN ash.event IN ('direct path read temp','direct path write temp') THEN 1 ELSE 0 END) AS temp_samples,
+         SUM(CASE WHEN ash.event LIKE 'cell%' THEN 1 ELSE 0 END) AS cell_samples,
+         SUM(CASE WHEN ash.event LIKE 'direct path%' THEN 1 ELSE 0 END) AS dp_samples,
+         COUNT(*) AS total_samples
+  FROM   gv$active_session_history ash
+  WHERE  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  ash.sql_id IS NOT NULL
+  GROUP  BY ash.sql_id
+)
+SELECT *
+FROM (
+  SELECT sql_id,
+         total_samples,
+         temp_samples,
+         cell_samples,
+         dp_samples,
+         ROUND(temp_samples * 100 / NULLIF(total_samples,0), 2) AS temp_pct,
+         ROUND(cell_samples * 100 / NULLIF(total_samples,0), 2) AS cell_pct,
+         ROUND(dp_samples   * 100 / NULLIF(total_samples,0), 2) AS dp_pct
+  FROM   base
+  ORDER  BY total_samples DESC
+)
+WHERE ROWNUM <= TO_NUMBER('&p_topn');
+
+prompt
+prompt [4] CURRENT SYSTEM PGA / TEMP SNAPSHOT
+SELECT name, value
+FROM   v$pgastat
+ORDER  BY name;
+
+SELECT tablespace_name,
+       ROUND(SUM(bytes_used) / 1024 / 1024 / 1024, 2) AS used_gb,
+       ROUND(SUM(bytes_free) / 1024 / 1024 / 1024, 2) AS free_gb
+FROM   v$temp_space_header
+GROUP  BY tablespace_name
+ORDER  BY used_gb DESC;
+
+prompt
+prompt [5] PER-SQL DETAIL WRAPPER LINES
+declare
+  cursor c_sql is
+    SELECT sql_id
+    FROM (
+      SELECT ash.sql_id, COUNT(*) AS samples
+      FROM   gv$active_session_history ash
+      WHERE  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                                 AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+        AND  ash.sql_id IS NOT NULL
+      GROUP  BY ash.sql_id
+      ORDER  BY samples DESC
+    )
+    WHERE ROWNUM <= TO_NUMBER('&p_topn');
+begin
+  for r in c_sql loop
+    dbms_output.put_line('@exadata_io_sql_detail_current.sql '||r.sql_id||' "'||'&p_start'||'" "'||'&p_end'||'"');
+  end loop;
+end;
+/
