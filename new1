@@ -1,0 +1,166 @@
+-- wait_events_by_snap_wrapper_v2.sql
+--
+-- Purpose:
+--   Generic RAC-aware wait-event drilldown by AWR snap range.
+--   No hard-coded wait event list.
+--
+-- Usage:
+--   @wait_events_by_snap_wrapper_v2.sql
+--
+-- Inputs:
+--   begin_snap_id
+--   end_snap_id
+--   instance_number -> enter ALL for cluster-wide
+--   event_name_like -> enter % for all events, or e.g. direct path%, cell%, log file%
+--   top_n
+--
+-- Output:
+--   event_name
+--   wait_class
+--   instance / ALL
+--   begin_snap_id
+--   end_snap_id
+--   begin_time
+--   end_time
+--   total_waits
+--   total_wait_secs
+--   avg_wait_ms
+--   waits_per_sec
+--   wait_secs_per_sec
+
+set pages 5000
+set lines 340
+set trimspool on
+set tab off
+set verify off
+set feedback on
+
+col event_name         format a42
+col wait_class         format a18
+col inst_display       format a10
+col begin_time         format a19
+col end_time           format a19
+col total_waits        format 999,999,999,999
+col total_wait_secs    format 999,999,999.99
+col avg_wait_ms        format 999,999,990.999
+col waits_per_sec      format 999,999,990.99
+col wait_secs_per_sec  format 999,999,990.99
+
+accept p_begin_snap prompt 'Begin Snap ID                     : '
+accept p_end_snap   prompt 'End Snap ID                       : '
+accept p_inst       prompt 'Instance Number [ALL for cluster] : ' default 'ALL'
+accept p_event_like prompt 'Event Name LIKE [% for all]       : ' default '%'
+accept p_topn       prompt 'Top N rows [100]                  : ' default '100'
+
+prompt
+prompt ==========================================================
+prompt WAIT EVENT DRILLDOWN BY SNAP RANGE
+prompt BEGIN SNAP : &&p_begin_snap
+prompt END SNAP   : &&p_end_snap
+prompt INSTANCE   : &&p_inst
+prompt EVENT LIKE : &&p_event_like
+prompt TOP N      : &&p_topn
+prompt ==========================================================
+prompt
+
+with snap_range as (
+    select s.dbid,
+           s.instance_number,
+           s.snap_id,
+           s.begin_interval_time,
+           s.end_interval_time
+    from   dba_hist_snapshot s
+    where  s.dbid = (select dbid from v$database)
+      and  s.snap_id between to_number('&&p_begin_snap') + 1
+                         and to_number('&&p_end_snap')
+      and (
+            upper(trim('&&p_inst')) = 'ALL'
+            or s.instance_number = to_number('&&p_inst')
+          )
+),
+event_data as (
+    select e.dbid,
+           e.instance_number,
+           e.snap_id,
+           e.event_name,
+           e.wait_class,
+           e.total_waits_delta,
+           e.time_waited_micro_delta
+    from   dba_hist_system_event e
+    where  e.dbid = (select dbid from v$database)
+      and  e.snap_id between to_number('&&p_begin_snap') + 1
+                         and to_number('&&p_end_snap')
+      and  e.wait_class <> 'Idle'
+      and (
+            upper(trim('&&p_inst')) = 'ALL'
+            or e.instance_number = to_number('&&p_inst')
+          )
+      and  lower(e.event_name) like lower('&&p_event_like')
+),
+joined_data as (
+    select e.event_name,
+           e.wait_class,
+           case
+             when upper(trim('&&p_inst')) = 'ALL' then 'ALL'
+             else to_char(e.instance_number)
+           end as inst_display,
+           s.snap_id - 1 as begin_snap_id,
+           s.snap_id     as end_snap_id,
+           s.begin_interval_time as begin_time,
+           s.end_interval_time   as end_time,
+           sum(e.total_waits_delta)       as total_waits,
+           sum(e.time_waited_micro_delta) as total_wait_micro
+    from   event_data e
+    join   snap_range s
+      on   s.dbid = e.dbid
+     and   s.instance_number = e.instance_number
+     and   s.snap_id = e.snap_id
+    group  by
+           e.event_name,
+           e.wait_class,
+           case
+             when upper(trim('&&p_inst')) = 'ALL' then 'ALL'
+             else to_char(e.instance_number)
+           end,
+           s.snap_id,
+           s.begin_interval_time,
+           s.end_interval_time
+)
+select *
+from (
+    select event_name,
+           wait_class,
+           inst_display,
+           begin_snap_id,
+           end_snap_id,
+           to_char(begin_time, 'YYYY-MM-DD HH24:MI:SS') as begin_time,
+           to_char(end_time,   'YYYY-MM-DD HH24:MI:SS') as end_time,
+           total_waits,
+           round(total_wait_micro / 1e6, 2) as total_wait_secs,
+           round(
+             case
+               when total_waits > 0
+               then (total_wait_micro / 1000) / total_waits
+             end,
+             3
+           ) as avg_wait_ms,
+           round(
+             case
+               when (cast(end_time as date) - cast(begin_time as date)) * 86400 > 0
+               then total_waits /
+                    ((cast(end_time as date) - cast(begin_time as date)) * 86400)
+             end,
+             2
+           ) as waits_per_sec,
+           round(
+             case
+               when (cast(end_time as date) - cast(begin_time as date)) * 86400 > 0
+               then (total_wait_micro / 1e6) /
+                    ((cast(end_time as date) - cast(begin_time as date)) * 86400)
+             end,
+             2
+           ) as wait_secs_per_sec
+    from   joined_data
+    order  by total_wait_micro desc, total_waits desc, end_snap_id
+)
+where rownum <= to_number('&&p_topn');
