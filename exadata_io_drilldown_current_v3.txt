@@ -1,0 +1,370 @@
+-- exadata_io_drilldown_current_v3.sql
+-- Purpose:
+--   RAC-aware current/recent Exadata + PGA/TEMP + PX + wait drilldown.
+--   Clean formatting for PGA and cell stats.
+-- Best for:
+--   Active incidents or recent windows still covered by GV$ACTIVE_SESSION_HISTORY.
+--
+-- Usage:
+--   @exadata_io_drilldown_current_v3.sql
+--
+-- Inputs:
+--   start_time : YYYY-MM-DD HH24:MI:SS
+--   end_time   : YYYY-MM-DD HH24:MI:SS
+--   top_n      : top SQL count
+
+set pagesize 5000
+set linesize 340
+set long 1000000
+set longchunksize 1000000
+set trimspool on
+set tab off
+set verify off
+set feedback on
+set serveroutput on size unlimited
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+prompt
+prompt Usage:
+prompt   @exadata_io_drilldown_current_v3.sql
+prompt Notes:
+prompt   - RAC aware
+prompt   - Uses GV$ views
+prompt   - Best for live/recent incidents
+prompt   - For older windows use exadata_io_drilldown_historic_v3.sql
+prompt
+
+accept p_start char prompt 'Start time (YYYY-MM-DD HH24:MI:SS): '
+accept p_end   char prompt 'End time   (YYYY-MM-DD HH24:MI:SS): '
+accept p_topn  char default '10' prompt 'Top SQL count [10]: '
+
+column sql_id format a13
+column event format a42
+column wait_class format a18
+column module format a28
+column machine format a30
+column program format a30
+column stat_name format a70
+column value_display format a22
+column pga_target_gb format 999,990.99
+column auto_target_gb format 999,990.99
+column total_alloc_gb format 999,990.99
+column total_inuse_gb format 999,990.99
+column max_alloc_gb format 999,990.99
+column global_bound_mb format 999,990.99
+column extra_rw_tb format 999,990.99
+column cache_hit_pct format 999,990.99
+column over_alloc_count format 999,999,999
+
+prompt ============================================================================
+prompt CURRENT / RECENT EXADATA IO DRILLDOWN V3
+prompt START: &p_start
+prompt END  : &p_end
+prompt TOP N: &p_topn
+prompt ============================================================================
+
+prompt
+prompt [1] TOP SQL BY ASH SAMPLES
+WITH x AS (
+  SELECT ash.sql_id,
+         COUNT(*) AS samples,
+         ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct,
+         MIN(ash.module)  AS module,
+         MIN(ash.machine) AS machine,
+         MIN(ash.program) AS program
+  FROM   gv$active_session_history ash
+  WHERE  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  ash.sql_id IS NOT NULL
+  GROUP  BY ash.sql_id
+)
+SELECT *
+FROM (
+  SELECT sql_id, samples, pct, module, machine, program
+  FROM   x
+  ORDER  BY samples DESC
+)
+WHERE ROWNUM <= TO_NUMBER('&p_topn');
+
+prompt
+prompt [2] OVERALL WAIT PROFILE
+SELECT NVL(event,'ON CPU') AS event,
+       wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history
+WHERE  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(event,'ON CPU'), wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [3] EXADATA / IO / TEMP WAIT PROFILE
+SELECT NVL(event,'ON CPU') AS event,
+       wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history
+WHERE  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+  AND (wait_class = 'User I/O'
+       OR event LIKE 'cell%'
+       OR event LIKE 'direct path%'
+       OR event LIKE 'db file%')
+GROUP  BY NVL(event,'ON CPU'), wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [4] TEMP / CELL / DIRECT PATH PROFILE BY SQL
+WITH base AS (
+  SELECT sql_id,
+         SUM(CASE WHEN event IN ('direct path read temp','direct path write temp') THEN 1 ELSE 0 END) AS temp_samples,
+         SUM(CASE WHEN event LIKE 'cell%' THEN 1 ELSE 0 END) AS cell_samples,
+         SUM(CASE WHEN event LIKE 'direct path%' THEN 1 ELSE 0 END) AS dp_samples,
+         COUNT(*) AS total_samples
+  FROM   gv$active_session_history
+  WHERE  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                         AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  sql_id IS NOT NULL
+  GROUP  BY sql_id
+)
+SELECT *
+FROM (
+  SELECT sql_id,
+         total_samples,
+         temp_samples,
+         cell_samples,
+         dp_samples,
+         ROUND(temp_samples * 100 / NULLIF(total_samples,0), 2) AS temp_pct,
+         ROUND(cell_samples * 100 / NULLIF(total_samples,0), 2) AS cell_pct,
+         ROUND(dp_samples   * 100 / NULLIF(total_samples,0), 2) AS dp_pct
+  FROM   base
+  ORDER  BY total_samples DESC
+)
+WHERE ROWNUM <= TO_NUMBER('&p_topn');
+
+prompt
+prompt [5] RAC INSTANCE DISTRIBUTION
+SELECT instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history
+WHERE  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY instance_number
+ORDER  BY samples DESC;
+
+prompt
+prompt [6] PX QC DISCOVERY
+SELECT *
+FROM (
+  SELECT qc_instance_id,
+         qc_session_id,
+         COUNT(*) AS samples,
+         COUNT(DISTINCT session_id) AS px_slave_count,
+         MIN(sample_time) AS first_seen,
+         MAX(sample_time) AS last_seen
+  FROM   gv$active_session_history
+  WHERE  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                         AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  qc_session_id IS NOT NULL
+  GROUP  BY qc_instance_id, qc_session_id
+  ORDER  BY samples DESC
+)
+WHERE ROWNUM <= 20;
+
+prompt
+prompt [7] RAC PGA SUMMARY IN GB/TB
+SELECT inst_id,
+       MAX(CASE WHEN name = 'aggregate PGA target parameter'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS pga_target_gb,
+       MAX(CASE WHEN name = 'aggregate PGA auto target'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS auto_target_gb,
+       MAX(CASE WHEN name = 'total PGA allocated'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS total_alloc_gb,
+       MAX(CASE WHEN name = 'total PGA inuse'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS total_inuse_gb,
+       MAX(CASE WHEN name = 'maximum PGA allocated'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS max_alloc_gb,
+       MAX(CASE WHEN name = 'global memory bound'
+                THEN ROUND(value/1024/1024, 2) END) AS global_bound_mb,
+       MAX(CASE WHEN name = 'extra bytes read/written'
+                THEN ROUND(value/1024/1024/1024/1024, 2) END) AS extra_rw_tb,
+       MAX(CASE WHEN name = 'cache hit percentage'
+                THEN value END) AS cache_hit_pct,
+       MAX(CASE WHEN name = 'over allocation count'
+                THEN value END) AS over_alloc_count
+FROM   gv$pgastat
+GROUP  BY inst_id
+ORDER  BY inst_id;
+
+prompt
+prompt [8] TEMP TABLESPACE SNAPSHOT
+SELECT tablespace_name,
+       ROUND(SUM(bytes_used) / 1024 / 1024 / 1024, 2) AS used_gb,
+       ROUND(SUM(bytes_free) / 1024 / 1024 / 1024, 2) AS free_gb
+FROM   v$temp_space_header
+GROUP  BY tablespace_name
+ORDER  BY used_gb DESC;
+
+prompt
+prompt [9] TEMP USERS BY SQL
+SELECT *
+FROM (
+  SELECT s.sql_id,
+         COUNT(*) AS sess_cnt,
+         ROUND(SUM(su.blocks * ts.block_size) / 1024 / 1024, 2) AS temp_mb
+  FROM   gv$sort_usage su
+  JOIN   gv$session s
+         ON s.saddr = su.session_addr
+        AND s.inst_id = su.inst_id
+  JOIN   dba_tablespaces ts
+         ON ts.tablespace_name = su.tablespace
+  WHERE  s.sql_id IS NOT NULL
+  GROUP  BY s.sql_id
+  ORDER  BY temp_mb DESC
+)
+WHERE ROWNUM <= 20;
+
+prompt
+prompt [10] ACTIVE WORKAREAS
+SELECT *
+FROM (
+  SELECT inst_id,
+         sid,
+         qcinst_id,
+         operation_type,
+         policy,
+         ROUND(actual_mem_used/1024/1024,2) AS actual_mem_mb,
+         ROUND(max_mem_used/1024/1024,2) AS max_mem_mb,
+         number_passes,
+         ROUND(tempseg_size/1024/1024,2) AS tempseg_mb,
+         ROUND(work_area_size/1024/1024,2) AS workarea_mb,
+         sql_id
+  FROM   gv$sql_workarea_active
+  ORDER  BY tempseg_size DESC NULLS LAST, actual_mem_used DESC NULLS LAST
+)
+WHERE ROWNUM <= 30;
+
+prompt
+prompt [11] SQL MONITOR ENTRIES IN WINDOW
+SELECT *
+FROM (
+  SELECT m.sql_id,
+         m.inst_id,
+         m.sid,
+         m.sql_exec_id,
+         TO_CHAR(m.sql_exec_start,'YYYY-MM-DD HH24:MI:SS') AS sql_exec_start,
+         m.status,
+         ROUND(m.elapsed_time/1e6,2) AS elapsed_s,
+         ROUND(m.cpu_time/1e6,2) AS cpu_s,
+         ROUND(m.user_io_wait_time/1e6,2) AS io_wait_s,
+         m.px_servers_requested,
+         m.px_servers_allocated,
+         m.sql_plan_hash_value
+  FROM   gv$sql_monitor m
+  WHERE  m.sql_exec_start BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                              AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+  ORDER  BY m.sql_exec_start DESC
+)
+WHERE ROWNUM <= 50;
+
+prompt
+prompt [12] CELL STAT SUMMARY - RAC PER INSTANCE
+SELECT inst_id,
+       RPAD(name,62) AS stat_name,
+       CASE
+           WHEN value >= POWER(1024,4) THEN TO_CHAR(ROUND(value/POWER(1024,4),2),'999999990.99') || ' TB'
+           WHEN value >= POWER(1024,3) THEN TO_CHAR(ROUND(value/POWER(1024,3),2),'999999990.99') || ' GB'
+           WHEN value >= POWER(1024,2) THEN TO_CHAR(ROUND(value/POWER(1024,2),2),'999999990.99') || ' MB'
+           WHEN value >= 1024          THEN TO_CHAR(ROUND(value/1024,2),'999999990.99') || ' KB'
+           ELSE TO_CHAR(value) || ' B'
+       END AS value_display
+FROM   gv$sysstat
+WHERE  name IN (
+    'cell physical IO bytes eligible for predicate offload',
+    'cell physical IO interconnect bytes',
+    'cell physical IO interconnect bytes returned by smart scan',
+    'cell IO uncompressed bytes',
+    'cell physical IO bytes saved by storage index',
+    'cell physical IO bytes saved by columnar cache',
+    'cell physical IO bytes saved by offload',
+    'cell scans',
+    'cell flash cache read hits',
+    'cell flash cache read hits for optimized reads',
+    'cell flash cache read hits for smart IO'
+)
+ORDER BY inst_id, name;
+
+prompt
+prompt [13] CELL STAT DETAIL - ALL CELL% STATS FORMATTED
+SELECT
+    RPAD(name,70) AS stat_name,
+    CASE
+        WHEN name LIKE 'cell physical IO bytes%'
+          OR name LIKE 'cell IO uncompressed bytes%'
+          OR name LIKE 'cell interconnect bytes%'
+          OR name LIKE 'cell RDMA bytes%'
+          OR name LIKE '%eligible for predicate offload'
+          OR name LIKE '%saved by storage index'
+          OR name LIKE '%saved by columnar cache'
+          OR name LIKE '%saved by offload'
+          OR name LIKE '%returned by smart scan'
+        THEN
+            CASE
+                WHEN value >= POWER(1024,4) THEN TO_CHAR(ROUND(value/POWER(1024,4),2),'999999990.99') || ' TB'
+                WHEN value >= POWER(1024,3) THEN TO_CHAR(ROUND(value/POWER(1024,3),2),'999999990.99') || ' GB'
+                WHEN value >= POWER(1024,2) THEN TO_CHAR(ROUND(value/POWER(1024,2),2),'999999990.99') || ' MB'
+                WHEN value >= 1024          THEN TO_CHAR(ROUND(value/1024,2),'999999990.99') || ' KB'
+                ELSE TO_CHAR(value) || ' B'
+            END
+        ELSE TO_CHAR(value,'999999999999999999')
+    END AS value_display
+FROM v$sysstat
+WHERE name LIKE 'cell%'
+ORDER BY
+    CASE
+        WHEN name LIKE '%returned by smart scan' THEN 1
+        WHEN name LIKE '%eligible for predicate offload' THEN 2
+        WHEN name LIKE '%saved by offload' THEN 3
+        WHEN name LIKE '%saved by storage index' THEN 4
+        WHEN name LIKE '%saved by columnar cache' THEN 5
+        ELSE 99
+    END,
+    name;
+
+prompt
+prompt [14] ASM REBALANCE STATUS
+SELECT group_number,
+       operation,
+       state,
+       power,
+       actual,
+       sofar,
+       est_work,
+       est_rate,
+       est_minutes,
+       error_code
+FROM   v$asm_operation;
+
+prompt
+prompt [15] PER-SQL DETAIL WRAPPER LINES
+declare
+  cursor c_sql is
+    SELECT sql_id
+    FROM (
+      SELECT sql_id, COUNT(*) AS samples
+      FROM   gv$active_session_history
+      WHERE  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+        AND  sql_id IS NOT NULL
+      GROUP  BY sql_id
+      ORDER  BY samples DESC
+    )
+    WHERE ROWNUM <= TO_NUMBER('&p_topn');
+begin
+  for r in c_sql loop
+    dbms_output.put_line('@exadata_io_sql_detail_current_v3.sql '||r.sql_id||' "'||'&p_start'||'" "'||'&p_end'||'"');
+  end loop;
+end;
+/

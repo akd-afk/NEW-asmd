@@ -1,0 +1,137 @@
+-- exadata_io_sql_runs_historic_v3.sql
+-- Usage:
+--   @exadata_io_sql_runs_historic_v3.sql <sql_id> [lookback_days]
+-- Purpose:
+--   Automatic prior-run history by SQL_ID.
+--   No start/end window entry required.
+--   Shows multiple previous runs, top wait events, avg wait time, plan hash, and execution pattern.
+
+set pagesize 5000
+set linesize 340
+set trimspool on
+set tab off
+set verify off
+set feedback on
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+define p_sql_id='&1'
+define p_days='&2'
+column sql_id new_value p_sql_id noprint
+column v_days new_value p_days noprint
+select NVL('&&p_sql_id','&1') sql_id from dual;
+select NVL(NULLIF('&&p_days',''),'14') v_days from dual;
+
+column event format a42
+column wait_class format a18
+column run_start format a19
+column run_end format a19
+column plan_hash_value format 999999999999
+
+prompt ============================================================================
+prompt HISTORIC PRIOR-RUN EXECUTION HISTORY V3
+prompt SQL_ID : &p_sql_id
+prompt DAYS   : &p_days
+prompt ============================================================================
+
+prompt
+prompt [1] SNAPSHOT-LEVEL EXECUTION HISTORY
+SELECT *
+FROM (
+  SELECT ss.instance_number,
+         TO_CHAR(sn.begin_interval_time,'YYYY-MM-DD HH24:MI:SS') AS run_start,
+         TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI:SS')   AS run_end,
+         ss.plan_hash_value,
+         ss.executions_delta AS execs,
+         ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_elapsed_s,
+         ROUND(ss.cpu_time_delta     / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_cpu_s,
+         ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_iowait_s,
+         ROUND(ss.clwait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_cluster_wait_s,
+         ROUND(ss.apwait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_app_wait_s,
+         ROUND(ss.ccwait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_concurrency_wait_s,
+         ROUND(ss.disk_reads_delta   / NULLIF(ss.executions_delta,0), 2)       AS avg_disk_reads,
+         ROUND(ss.buffer_gets_delta  / NULLIF(ss.executions_delta,0), 2)       AS avg_buffer_gets,
+         ROUND(ss.rows_processed_delta / NULLIF(ss.executions_delta,0), 2)     AS avg_rows,
+         ss.px_servers_execs_delta
+  FROM   dba_hist_sqlstat ss
+  JOIN   dba_hist_snapshot sn
+         ON sn.dbid = ss.dbid
+        AND sn.instance_number = ss.instance_number
+        AND sn.snap_id = ss.snap_id
+  WHERE  ss.dbid = (SELECT dbid FROM v$database)
+    AND  ss.sql_id = '&p_sql_id'
+    AND  sn.end_interval_time >= SYSDATE - TO_NUMBER('&p_days')
+  ORDER  BY sn.end_interval_time DESC, ss.instance_number
+)
+WHERE ROWNUM <= 100;
+
+prompt
+prompt [2] TOP WAIT EVENTS BY PRIOR TIME BUCKET
+WITH ashb AS (
+  SELECT ash.instance_number,
+         TO_CHAR(TRUNC(CAST(ash.sample_time AS DATE), 'HH24'),'YYYY-MM-DD HH24:00:00') AS hour_bucket,
+         NVL(ash.event,'ON CPU') AS event,
+         ash.wait_class,
+         COUNT(*) AS samples
+  FROM   dba_hist_active_sess_history ash
+  WHERE  ash.dbid = (SELECT dbid FROM v$database)
+    AND  ash.sql_id = '&p_sql_id'
+    AND  ash.sample_time >= SYSDATE - TO_NUMBER('&p_days')
+  GROUP  BY ash.instance_number,
+            TO_CHAR(TRUNC(CAST(ash.sample_time AS DATE), 'HH24'),'YYYY-MM-DD HH24:00:00'),
+            NVL(ash.event,'ON CPU'),
+            ash.wait_class
+)
+SELECT *
+FROM (
+  SELECT instance_number,
+         hour_bucket,
+         event,
+         wait_class,
+         samples,
+         ROUND(samples * 10, 2) AS approx_wait_seconds
+  FROM   ashb
+  ORDER  BY hour_bucket DESC, samples DESC
+)
+WHERE ROWNUM <= 200;
+
+prompt
+prompt [3] PLAN HASH HISTORY
+SELECT plan_hash_value,
+       COUNT(*) AS snap_rows,
+       MIN(sn.begin_interval_time) AS first_seen,
+       MAX(sn.end_interval_time)   AS last_seen
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.dbid = (SELECT dbid FROM v$database)
+  AND  ss.sql_id = '&p_sql_id'
+  AND  sn.end_interval_time >= SYSDATE - TO_NUMBER('&p_days')
+GROUP  BY plan_hash_value
+ORDER  BY last_seen DESC;
+
+prompt
+prompt [4] PRIOR-RUN TEMP / CELL / DIRECT PATH PROFILE
+WITH base AS (
+  SELECT TO_CHAR(TRUNC(CAST(sample_time AS DATE), 'HH24'),'YYYY-MM-DD HH24:00:00') AS hour_bucket,
+         SUM(CASE WHEN event IN ('direct path read temp','direct path write temp') THEN 1 ELSE 0 END) AS temp_samples,
+         SUM(CASE WHEN event LIKE 'cell%' THEN 1 ELSE 0 END) AS cell_samples,
+         SUM(CASE WHEN event LIKE 'direct path%' THEN 1 ELSE 0 END) AS dp_samples,
+         COUNT(*) AS total_samples
+  FROM   dba_hist_active_sess_history
+  WHERE  dbid = (SELECT dbid FROM v$database)
+    AND  sql_id = '&p_sql_id'
+    AND  sample_time >= SYSDATE - TO_NUMBER('&p_days')
+  GROUP  BY TO_CHAR(TRUNC(CAST(sample_time AS DATE), 'HH24'),'YYYY-MM-DD HH24:00:00')
+)
+SELECT hour_bucket,
+       total_samples,
+       temp_samples,
+       cell_samples,
+       dp_samples,
+       ROUND(temp_samples * 100 / NULLIF(total_samples,0), 2) AS temp_pct,
+       ROUND(cell_samples * 100 / NULLIF(total_samples,0), 2) AS cell_pct,
+       ROUND(dp_samples   * 100 / NULLIF(total_samples,0), 2) AS dp_pct
+FROM   base
+ORDER  BY hour_bucket DESC;

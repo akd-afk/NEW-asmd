@@ -1,0 +1,165 @@
+-- exadata_io_drilldown_historic_v3.sql
+-- Usage:
+--   @exadata_io_drilldown_historic_v3.sql
+-- Purpose:
+--   Historic RAC-aware window finder using AWR / DBA_HIST views.
+--   Emits both point-in-time detail wrappers and prior-run history wrappers.
+
+set pagesize 5000
+set linesize 340
+set long 1000000
+set longchunksize 1000000
+set trimspool on
+set tab off
+set verify off
+set feedback on
+set serveroutput on size unlimited
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+prompt
+prompt Usage:
+prompt   @exadata_io_drilldown_historic_v3.sql
+prompt Notes:
+prompt   - Uses DBA_HIST_* views
+prompt   - Best for older windows / after-the-fact RCA
+prompt   - Emits point-in-time and prior-run wrapper lines
+prompt
+
+accept p_start char prompt 'Start time (YYYY-MM-DD HH24:MI:SS): '
+accept p_end   char prompt 'End time   (YYYY-MM-DD HH24:MI:SS): '
+accept p_topn  char default '10' prompt 'Top SQL count [10]: '
+accept p_days  char default '14' prompt 'Execution history lookback days [14]: '
+
+column sql_id format a13
+column event format a42
+column wait_class format a18
+
+prompt ============================================================================
+prompt HISTORIC EXADATA IO DRILLDOWN V3
+prompt START : &p_start
+prompt END   : &p_end
+prompt TOP N : &p_topn
+prompt DAYS  : &p_days
+prompt ============================================================================
+
+prompt
+prompt [1] TOP SQL BY HISTORIC ASH SAMPLES
+WITH x AS (
+  SELECT ash.sql_id,
+         COUNT(*) AS samples,
+         ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+  FROM   dba_hist_active_sess_history ash
+  WHERE  ash.dbid = (SELECT dbid FROM v$database)
+    AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  ash.sql_id IS NOT NULL
+  GROUP  BY ash.sql_id
+)
+SELECT *
+FROM (
+  SELECT sql_id, samples, pct
+  FROM   x
+  ORDER  BY samples DESC
+)
+WHERE ROWNUM <= TO_NUMBER('&p_topn');
+
+prompt
+prompt [2] HISTORIC WAIT PROFILE
+SELECT NVL(event,'ON CPU') AS event,
+       wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   dba_hist_active_sess_history
+WHERE  dbid = (SELECT dbid FROM v$database)
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(event,'ON CPU'), wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [3] HISTORIC TEMP / CELL / DIRECT PATH PROFILE BY SQL
+WITH base AS (
+  SELECT sql_id,
+         SUM(CASE WHEN event IN ('direct path read temp','direct path write temp') THEN 1 ELSE 0 END) AS temp_samples,
+         SUM(CASE WHEN event LIKE 'cell%' THEN 1 ELSE 0 END) AS cell_samples,
+         SUM(CASE WHEN event LIKE 'direct path%' THEN 1 ELSE 0 END) AS dp_samples,
+         COUNT(*) AS total_samples
+  FROM   dba_hist_active_sess_history
+  WHERE  dbid = (SELECT dbid FROM v$database)
+    AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                         AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+    AND  sql_id IS NOT NULL
+  GROUP  BY sql_id
+)
+SELECT *
+FROM (
+  SELECT sql_id,
+         total_samples,
+         temp_samples,
+         cell_samples,
+         dp_samples,
+         ROUND(temp_samples * 100 / NULLIF(total_samples,0), 2) AS temp_pct,
+         ROUND(cell_samples * 100 / NULLIF(total_samples,0), 2) AS cell_pct,
+         ROUND(dp_samples   * 100 / NULLIF(total_samples,0), 2) AS dp_pct
+  FROM   base
+  ORDER  BY total_samples DESC
+)
+WHERE ROWNUM <= TO_NUMBER('&p_topn');
+
+prompt
+prompt [4] RAC INSTANCE DISTRIBUTION
+SELECT instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   dba_hist_active_sess_history
+WHERE  dbid = (SELECT dbid FROM v$database)
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY instance_number
+ORDER  BY samples DESC;
+
+prompt
+prompt [5] PER-SQL POINT-IN-TIME DETAIL WRAPPER LINES
+declare
+  cursor c_sql is
+    SELECT sql_id
+    FROM (
+      SELECT sql_id, COUNT(*) AS samples
+      FROM   dba_hist_active_sess_history
+      WHERE  dbid = (SELECT dbid FROM v$database)
+        AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+        AND  sql_id IS NOT NULL
+      GROUP  BY sql_id
+      ORDER  BY samples DESC
+    )
+    WHERE ROWNUM <= TO_NUMBER('&p_topn');
+begin
+  for r in c_sql loop
+    dbms_output.put_line('@exadata_io_sql_detail_historic_v3.sql '||r.sql_id||' "'||'&p_start'||'" "'||'&p_end'||'"');
+  end loop;
+end;
+/
+
+prompt
+prompt [6] PER-SQL PRIOR-RUN HISTORY WRAPPER LINES
+declare
+  cursor c_sql is
+    SELECT sql_id
+    FROM (
+      SELECT sql_id, COUNT(*) AS samples
+      FROM   dba_hist_active_sess_history
+      WHERE  dbid = (SELECT dbid FROM v$database)
+        AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                             AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+        AND  sql_id IS NOT NULL
+      GROUP  BY sql_id
+      ORDER  BY samples DESC
+    )
+    WHERE ROWNUM <= TO_NUMBER('&p_topn');
+begin
+  for r in c_sql loop
+    dbms_output.put_line('@exadata_io_sql_runs_historic_v3.sql '||r.sql_id||' '||'&p_days');
+  end loop;
+end;
+/

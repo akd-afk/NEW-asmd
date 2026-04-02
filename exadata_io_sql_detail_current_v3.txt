@@ -1,0 +1,282 @@
+-- exadata_io_sql_detail_current_v3.sql
+-- Usage:
+--   @exadata_io_sql_detail_current_v3.sql <sql_id> "<start_time>" "<end_time>"
+
+set pagesize 5000
+set linesize 340
+set trimspool on
+set tab off
+set verify off
+set feedback on
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+define p_sql_id='&1'
+define p_start='&2'
+define p_end='&3'
+
+column event format a42
+column wait_class format a18
+column operation format a28
+column options format a24
+column object_owner format a20
+column object_name format a35
+column stat_name format a70
+column value_display format a22
+
+prompt ============================================================================
+prompt CURRENT SQL DETAIL DRILLDOWN V3
+prompt SQL_ID: &p_sql_id
+prompt START : &p_start
+prompt END   : &p_end
+prompt ============================================================================
+
+prompt
+prompt [A] BASIC PROFILE
+SELECT ash.sql_id,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 2) AS approx_active_min,
+       MIN(ash.module) AS module,
+       MIN(ash.machine) AS machine,
+       MIN(ash.program) AS program
+FROM   gv$active_session_history ash
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY ash.sql_id;
+
+prompt
+prompt [B] WAIT PROFILE
+SELECT NVL(event,'ON CPU') AS event,
+       wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history
+WHERE  sql_id = '&p_sql_id'
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(event,'ON CPU'), wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [C] HOT PLAN LINES
+SELECT sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   gv$active_session_history ash
+LEFT JOIN gv$sql_plan sp
+       ON sp.inst_id = ash.inst_id
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+prompt
+prompt [D] IO / CELL HEAVY PLAN LINES
+SELECT sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   gv$active_session_history ash
+LEFT JOIN gv$sql_plan sp
+       ON sp.inst_id = ash.inst_id
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+  AND (ash.wait_class = 'User I/O'
+       OR ash.event LIKE 'cell%'
+       OR ash.event LIKE 'direct path%'
+       OR ash.event LIKE 'db file%')
+GROUP  BY sql_plan_line_id,
+          sp.id,
+          sp.operation,
+          sp.options,
+          sp.object_owner,
+          sp.object_name
+ORDER  BY samples DESC;
+
+prompt
+prompt [E] TEMP-SPILL BY SESSION / PLAN LINE
+SELECT session_id,
+       session_serial#,
+       instance_number,
+       sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   gv$active_session_history
+WHERE  sql_id = '&p_sql_id'
+  AND  event IN ('direct path read temp','direct path write temp')
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY session_id, session_serial#, instance_number, sql_plan_line_id
+ORDER  BY temp_samples DESC;
+
+prompt
+prompt [F] RAC DISTRIBUTION
+SELECT instance_number,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   gv$active_session_history
+WHERE  sql_id = '&p_sql_id'
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY instance_number
+ORDER  BY samples DESC;
+
+prompt
+prompt [G] PX QC / SLAVE DISTRIBUTION
+SELECT qc_instance_id,
+       qc_session_id,
+       session_type,
+       COUNT(*) AS samples,
+       COUNT(DISTINCT session_id) AS sess_count
+FROM   gv$active_session_history
+WHERE  sql_id = '&p_sql_id'
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY qc_instance_id, qc_session_id, session_type
+ORDER  BY samples DESC;
+
+prompt
+prompt [H] CURRENT TEMP USERS FOR THIS SQL
+SELECT s.inst_id,
+       s.sid,
+       s.serial#,
+       s.username,
+       s.sql_id,
+       su.tablespace,
+       ROUND(su.blocks * ts.block_size / 1024 / 1024, 2) AS temp_mb,
+       su.segtype,
+       s.program,
+       s.module
+FROM   gv$sort_usage su
+JOIN   gv$session s
+       ON s.saddr = su.session_addr
+      AND s.inst_id = su.inst_id
+JOIN   dba_tablespaces ts
+       ON ts.tablespace_name = su.tablespace
+WHERE  s.sql_id = '&p_sql_id'
+ORDER  BY temp_mb DESC;
+
+prompt
+prompt [I] SQL WORKAREA ACTIVE
+SELECT inst_id,
+       sid,
+       qcinst_id,
+       operation_type,
+       policy,
+       ROUND(actual_mem_used/1024/1024,2) AS actual_mem_mb,
+       ROUND(max_mem_used/1024/1024,2) AS max_mem_mb,
+       number_passes,
+       ROUND(tempseg_size/1024/1024,2) AS tempseg_mb,
+       ROUND(work_area_size/1024/1024,2) AS workarea_mb,
+       sql_id
+FROM   gv$sql_workarea_active
+WHERE  sql_id = '&p_sql_id'
+ORDER  BY tempseg_size DESC NULLS LAST, actual_mem_used DESC NULLS LAST;
+
+prompt
+prompt [J] SQL WORKAREA EXECUTION PROFILE
+SELECT sql_id,
+       child_number,
+       operation_type,
+       policy,
+       ROUND(estimated_optimal_size/1024/1024,2) AS est_optimal_mb,
+       ROUND(estimated_onepass_size/1024/1024,2) AS est_onepass_mb,
+       ROUND(last_memory_used/1024/1024,2) AS last_mem_mb,
+       last_execution,
+       last_degree,
+       total_executions,
+       optimal_executions,
+       onepass_executions,
+       multipasses_executions,
+       active_time
+FROM   v$sql_workarea
+WHERE  sql_id = '&p_sql_id'
+ORDER  BY active_time DESC, operation_type;
+
+prompt
+prompt [K] SQL MONITOR ENTRIES
+SELECT inst_id,
+       sid,
+       sql_exec_id,
+       TO_CHAR(sql_exec_start,'YYYY-MM-DD HH24:MI:SS') AS sql_exec_start,
+       status,
+       ROUND(elapsed_time/1e6,2) AS elapsed_s,
+       ROUND(cpu_time/1e6,2) AS cpu_s,
+       ROUND(user_io_wait_time/1e6,2) AS io_wait_s,
+       px_servers_requested,
+       px_servers_allocated,
+       sql_plan_hash_value
+FROM   gv$sql_monitor
+WHERE  sql_id = '&p_sql_id'
+ORDER  BY sql_exec_start DESC;
+
+prompt
+prompt [L] RAC PGA SUMMARY IN GB/TB
+SELECT inst_id,
+       MAX(CASE WHEN name = 'aggregate PGA target parameter'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS pga_target_gb,
+       MAX(CASE WHEN name = 'aggregate PGA auto target'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS auto_target_gb,
+       MAX(CASE WHEN name = 'total PGA allocated'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS total_alloc_gb,
+       MAX(CASE WHEN name = 'total PGA inuse'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS total_inuse_gb,
+       MAX(CASE WHEN name = 'maximum PGA allocated'
+                THEN ROUND(value/1024/1024/1024, 2) END) AS max_alloc_gb,
+       MAX(CASE WHEN name = 'global memory bound'
+                THEN ROUND(value/1024/1024, 2) END) AS global_bound_mb,
+       MAX(CASE WHEN name = 'extra bytes read/written'
+                THEN ROUND(value/1024/1024/1024/1024, 2) END) AS extra_rw_tb,
+       MAX(CASE WHEN name = 'cache hit percentage'
+                THEN value END) AS cache_hit_pct,
+       MAX(CASE WHEN name = 'over allocation count'
+                THEN value END) AS over_alloc_count
+FROM   gv$pgastat
+GROUP  BY inst_id
+ORDER  BY inst_id;
+
+prompt
+prompt [M] CELL STAT SUMMARY - RAC PER INSTANCE
+SELECT inst_id,
+       RPAD(name,62) AS stat_name,
+       CASE
+           WHEN value >= POWER(1024,4) THEN TO_CHAR(ROUND(value/POWER(1024,4),2),'999999990.99') || ' TB'
+           WHEN value >= POWER(1024,3) THEN TO_CHAR(ROUND(value/POWER(1024,3),2),'999999990.99') || ' GB'
+           WHEN value >= POWER(1024,2) THEN TO_CHAR(ROUND(value/POWER(1024,2),2),'999999990.99') || ' MB'
+           WHEN value >= 1024          THEN TO_CHAR(ROUND(value/1024,2),'999999990.99') || ' KB'
+           ELSE TO_CHAR(value) || ' B'
+       END AS value_display
+FROM   gv$sysstat
+WHERE  name IN (
+    'cell physical IO bytes eligible for predicate offload',
+    'cell physical IO interconnect bytes',
+    'cell physical IO interconnect bytes returned by smart scan',
+    'cell IO uncompressed bytes',
+    'cell physical IO bytes saved by storage index',
+    'cell physical IO bytes saved by columnar cache',
+    'cell physical IO bytes saved by offload',
+    'cell scans',
+    'cell flash cache read hits',
+    'cell flash cache read hits for optimized reads',
+    'cell flash cache read hits for smart IO'
+)
+ORDER BY inst_id, name;

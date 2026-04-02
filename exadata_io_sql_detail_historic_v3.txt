@@ -1,0 +1,142 @@
+-- exadata_io_sql_detail_historic_v3.sql
+-- Usage:
+--   @exadata_io_sql_detail_historic_v3.sql <sql_id> "<start_time>" "<end_time>"
+
+set pagesize 5000
+set linesize 340
+set trimspool on
+set tab off
+set verify off
+set feedback on
+alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+define p_sql_id='&1'
+define p_start='&2'
+define p_end='&3'
+
+column event format a42
+column wait_class format a18
+column operation format a28
+column options format a24
+column object_owner format a20
+column object_name format a35
+column stat_name format a70
+column value_display format a22
+
+prompt ============================================================================
+prompt HISTORIC SQL DETAIL DRILLDOWN V3
+prompt SQL_ID: &p_sql_id
+prompt START : &p_start
+prompt END   : &p_end
+prompt ============================================================================
+
+prompt
+prompt [A] BASIC PROFILE
+SELECT sql_id,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 10 / 60, 2) AS approx_active_min
+FROM   dba_hist_active_sess_history
+WHERE  dbid = (SELECT dbid FROM v$database)
+  AND  sql_id = '&p_sql_id'
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY sql_id;
+
+prompt
+prompt [B] WAIT PROFILE
+SELECT NVL(event,'ON CPU') AS event,
+       wait_class,
+       COUNT(*) AS samples,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM   dba_hist_active_sess_history
+WHERE  dbid = (SELECT dbid FROM v$database)
+  AND  sql_id = '&p_sql_id'
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY NVL(event,'ON CPU'), wait_class
+ORDER  BY samples DESC;
+
+prompt
+prompt [C] HOT PLAN LINES
+SELECT sql_plan_line_id,
+       sp.id,
+       sp.operation,
+       sp.options,
+       sp.object_owner,
+       sp.object_name,
+       COUNT(*) AS samples
+FROM   dba_hist_active_sess_history ash
+LEFT JOIN dba_hist_sql_plan sp
+       ON sp.dbid = ash.dbid
+      AND sp.sql_id = ash.sql_id
+      AND sp.plan_hash_value = ash.sql_plan_hash_value
+      AND sp.id = ash.sql_plan_line_id
+WHERE  ash.dbid = (SELECT dbid FROM v$database)
+  AND  ash.sql_id = '&p_sql_id'
+  AND  ash.sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                           AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY sql_plan_line_id, sp.id, sp.operation, sp.options, sp.object_owner, sp.object_name
+ORDER  BY samples DESC;
+
+prompt
+prompt [D] TEMP-SPILL BY SESSION / PLAN LINE
+SELECT session_id,
+       session_serial#,
+       instance_number,
+       sql_plan_line_id,
+       COUNT(*) AS temp_samples
+FROM   dba_hist_active_sess_history
+WHERE  dbid = (SELECT dbid FROM v$database)
+  AND  sql_id = '&p_sql_id'
+  AND  event IN ('direct path read temp','direct path write temp')
+  AND  sample_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                       AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+GROUP  BY session_id, session_serial#, instance_number, sql_plan_line_id
+ORDER  BY temp_samples DESC;
+
+prompt
+prompt [E] HISTORIC SQLSTAT PROFILE
+SELECT ss.instance_number,
+       TO_CHAR(sn.begin_interval_time,'YYYY-MM-DD HH24:MI:SS') AS begin_time,
+       TO_CHAR(sn.end_interval_time,'YYYY-MM-DD HH24:MI:SS')   AS end_time,
+       ss.plan_hash_value,
+       ss.executions_delta AS execs,
+       ROUND(ss.elapsed_time_delta / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_elapsed_s,
+       ROUND(ss.cpu_time_delta     / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_cpu_s,
+       ROUND(ss.iowait_delta       / NULLIF(ss.executions_delta,0) / 1e6, 2) AS avg_iowait_s,
+       ROUND(ss.disk_reads_delta   / NULLIF(ss.executions_delta,0), 2)       AS avg_disk_reads,
+       ROUND(ss.buffer_gets_delta  / NULLIF(ss.executions_delta,0), 2)       AS avg_buffer_gets,
+       ROUND(ss.rows_processed_delta / NULLIF(ss.executions_delta,0), 2)     AS avg_rows
+FROM   dba_hist_sqlstat ss
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = ss.dbid
+      AND sn.instance_number = ss.instance_number
+      AND sn.snap_id = ss.snap_id
+WHERE  ss.dbid = (SELECT dbid FROM v$database)
+  AND  ss.sql_id = '&p_sql_id'
+  AND  sn.end_interval_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                               AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+ORDER  BY sn.end_interval_time, ss.instance_number;
+
+prompt
+prompt [F] HISTORIC CELL STAT DELTAS
+SELECT sn.begin_interval_time,
+       sn.end_interval_time,
+       RPAD(st.stat_name,70) AS stat_name,
+       CASE
+           WHEN st.value_delta >= POWER(1024,4) THEN TO_CHAR(ROUND(st.value_delta/POWER(1024,4),2),'999999990.99') || ' TB'
+           WHEN st.value_delta >= POWER(1024,3) THEN TO_CHAR(ROUND(st.value_delta/POWER(1024,3),2),'999999990.99') || ' GB'
+           WHEN st.value_delta >= POWER(1024,2) THEN TO_CHAR(ROUND(st.value_delta/POWER(1024,2),2),'999999990.99') || ' MB'
+           WHEN st.value_delta >= 1024          THEN TO_CHAR(ROUND(st.value_delta/1024,2),'999999990.99') || ' KB'
+           ELSE TO_CHAR(st.value_delta) || ' B'
+       END AS value_display
+FROM   dba_hist_sysstat st
+JOIN   dba_hist_snapshot sn
+       ON sn.dbid = st.dbid
+      AND sn.instance_number = st.instance_number
+      AND sn.snap_id = st.snap_id
+WHERE  st.dbid = (SELECT dbid FROM v$database)
+  AND  st.stat_name LIKE 'cell%'
+  AND  sn.end_interval_time BETWEEN TO_DATE('&p_start','YYYY-MM-DD HH24:MI:SS')
+                               AND TO_DATE('&p_end','YYYY-MM-DD HH24:MI:SS')
+ORDER  BY sn.end_interval_time, st.stat_name;
