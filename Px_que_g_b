@@ -1,3 +1,10 @@
+Oracle’s current feedback is that the issue appears to be workload specific and is most visible on the nightly analytics and batch path. Based on the data reviewed so far, the newer cells appear healthy, while the older existing cells have been carrying more of the load. Performance also did not immediately return to normal after ASM rebalance was cancelled.
+
+Oracle’s current working theory is that the behavior may be related to how this workload is interacting with the newer cells, but that is still being validated and is not yet a closed root cause. They also noted that while additional storage can generally be introduced online, the actual effect can vary by workload pattern. Based on the discussion so far, there may continue to be some sensitivity on this path until the newer cells are more fully utilized by the workload and the flash layer reaches a more mature steady state.
+
+For now, ASM rebalance will remain stopped, the Sev1 SR will stay active, and the environment will continue to be monitored closely through the batch cycle. Additional AWR data from the impacted windows is being provided to Oracle, and further mitigation will be guided by the results of that analysis and tonight’s runtime behavior.
+
+
 imagehistory
 grep -RinE "Starting|Completed|Success|Failed|Error" /var/log/cellos/dbnodeupdate* 2>/dev/null
 systemctl status ctm_agent --no-pager -l
